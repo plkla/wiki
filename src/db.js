@@ -179,10 +179,16 @@ function createWikiDb(dbPathOrOptions) {
     } catch {
       infobox = {};
     }
+    if (typeof infobox !== 'object' || infobox === null || Array.isArray(infobox)) {
+      infobox = {};
+    }
 
     try {
       categories = typeof row.categories === 'string' ? JSON.parse(row.categories) : (row.categories || []);
     } catch {
+      categories = [];
+    }
+    if (!Array.isArray(categories)) {
       categories = [];
     }
 
@@ -213,10 +219,16 @@ function createWikiDb(dbPathOrOptions) {
     } catch {
       infobox = {};
     }
+    if (typeof infobox !== 'object' || infobox === null || Array.isArray(infobox)) {
+      infobox = {};
+    }
 
     try {
       categories = typeof row.categories === 'string' ? JSON.parse(row.categories) : (row.categories || []);
     } catch {
+      categories = [];
+    }
+    if (!Array.isArray(categories)) {
       categories = [];
     }
 
@@ -343,9 +355,11 @@ function createWikiDb(dbPathOrOptions) {
       try {
         const arr = typeof r.categories === 'string' ? JSON.parse(r.categories) : r.categories;
         if (Array.isArray(arr)) {
+          const seenInArticle = new Set();
           for (const item of arr) {
             const cat = String(item || '').trim();
-            if (cat) {
+            if (cat && !seenInArticle.has(cat.toLowerCase())) {
+              seenInArticle.add(cat.toLowerCase());
               counts.set(cat, (counts.get(cat) || 0) + 1);
             }
           }
@@ -561,8 +575,14 @@ function createWikiDb(dbPathOrOptions) {
     }
 
     const newTitle = title !== undefined ? String(title).trim() : current.title;
+    if (title !== undefined && !newTitle) {
+      throw new Error('Tytuł artykułu nie może być pusty.');
+    }
     const newSummary = summary !== undefined ? String(summary).trim() : current.summary;
     const newContent = content !== undefined ? String(content) : current.content;
+    if (content !== undefined && content == null) {
+      throw new Error('Treść artykułu nie może być pusta.');
+    }
     const newInfobox = infobox !== undefined ? normalizeInfobox(infobox) : current.infobox;
     const newCategories = categories !== undefined ? normalizeCategories(categories) : current.categories;
     const newComment = String(edit_comment || 'Edycja artykułu');
@@ -747,9 +767,9 @@ function createWikiDb(dbPathOrOptions) {
     return true;
   }
 
-  function getRecentChanges(limit = 20) {
+  function getRecentChanges(limit = 20, { includeUnpublished = false } = {}) {
     const lim = Math.max(1, Math.min(200, Number(limit) || 20));
-    const rows = db.prepare(`
+    let sql = `
       SELECT
         r.id,
         r.article_slug,
@@ -764,8 +784,14 @@ function createWikiDb(dbPathOrOptions) {
         a.is_published
       FROM revisions r
       LEFT JOIN articles a ON LOWER(r.article_slug) = LOWER(a.slug)
-      ORDER BY r.id DESC LIMIT ?
-    `).all(lim);
+    `;
+
+    if (!includeUnpublished) {
+      sql += ' WHERE (a.is_published = 1 OR a.id IS NULL)';
+    }
+
+    sql += ' ORDER BY r.id DESC LIMIT ?';
+    const rows = db.prepare(sql).all(lim);
 
     return rows.map(r => ({
       id: Number(r.id),
@@ -862,7 +888,10 @@ function createWikiDb(dbPathOrOptions) {
     }
 
     const validRoles = ['admin', 'editor', 'user', 'blocked'];
-    const chosenRole = validRoles.includes(role) ? role : 'user';
+    if (role !== undefined && !validRoles.includes(role)) {
+      throw new Error(`Nieprawidłowa rola "${role}". Dozwolone: ${validRoles.join(', ')}.`);
+    }
+    const chosenRole = role || 'user';
     const cleanUser = String(username).trim();
 
     const existing = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(cleanUser);
@@ -922,7 +951,7 @@ function createWikiDb(dbPathOrOptions) {
 
     const current = db.prepare('SELECT * FROM articles WHERE LOWER(slug) = ?').get(cleanSlug);
     if (!current) {
-      throw new Error(`Artykuł "${cleanSlug}" nie istnieje.`);
+      return null;
     }
 
     const newLocked = is_locked !== undefined ? (is_locked ? 1 : 0) : current.is_locked;
@@ -1010,7 +1039,7 @@ function createWikiDb(dbPathOrOptions) {
     // Jeśli nie są ustawione, generowane jest losowe hasło wypisywane jednorazowo w konsoli serwera.
     const resolveSeedPassword = (envName, username) => {
       const fromEnv = process.env[envName];
-      if (fromEnv && String(fromEnv).length >= 8) return String(fromEnv);
+      if (fromEnv && String(fromEnv).trim().length >= 3) return String(fromEnv).trim();
       const generated = crypto.randomBytes(12).toString('base64url');
       if (dbPath !== ':memory:') {
         console.log(`[WikiKurekk] Wygenerowano hasło dla konta "${username}": ${generated} (ustaw ${envName}, aby podać własne)`);

@@ -5,6 +5,8 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test tests/wiki.test.js"
+    "test": "node --test tests/wiki.test.js tests/e2e.test.js",
+    "test:unit": "node --test tests/wiki.test.js",
+    "test:e2e": "node --test tests/e2e.test.js"
   }
 }

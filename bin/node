@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+export NODE_OPTIONS="--experimental-sqlite ${NODE_OPTIONS:-}"
+exec "$(dirname "$0")/node-bin" "$@"

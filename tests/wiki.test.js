@@ -38,6 +38,15 @@ describe('1. Parser Wiki (src/wiki-parser.js)', () => {
       assert.equal(slugify('---Polska---Warszawa---'), 'polska-warszawa');
       assert.equal(slugify('Specjalne // znaki $$ i ##'), 'specjalne-znaki-i');
     });
+
+    test('obsługuje przypadki brzegowe slugify (puste, symbole, znaki specjalne)', () => {
+      assert.equal(slugify(''), '');
+      assert.equal(slugify(null), '');
+      assert.equal(slugify(undefined), '');
+      assert.equal(slugify('   '), '');
+      assert.equal(slugify('???###$$$'), '');
+      assert.equal(slugify('München & København'), 'munchen-kobenhavn');
+    });
   });
 
   describe('renderWikiContent', () => {
@@ -87,6 +96,33 @@ describe('1. Parser Wiki (src/wiki-parser.js)', () => {
       assert.ok(result.html.includes('Główny Urząd Statystyczny 2024'), 'HTML powinien zawierać treść przypisu');
     });
 
+    test('obsługuje przypisy z atrybutami <ref name="..."> oraz zapobiega XSS', () => {
+      const input = `Informacja<ref name="zrodlo-1">Źródło z atrybutem</ref> oraz próba ataku: <script>alert("XSS")</script>.`;
+      const result = renderWikiContent(input, new Set());
+
+      assert.ok(result.html.includes('Źródło z atrybutem'), 'Przypis z atrybutem powinien zostać poprawnie sparsowany');
+      assert.ok(result.html.includes('&lt;script&gt;alert(&quot;XSS&quot;)&lt;/script&gt;'), 'Tagi script muszą być bezpiecznie escapowane');
+      assert.ok(!result.html.includes('<script>'), 'HTML nie może zawierać niezaescapowanego znacznika script');
+    });
+
+    test('bezpiecznie renderuje kod inline i bloki kodu ze znakami specjalnymi ($1, $&, gwiazdki, encje)', () => {
+      const input = `
+\`a * b * c\`
+\`regex $1, $&, $'\`
+\`[[link-w-kodzie]]\`
+\`\`\`bash
+echo "$1" && grep -E "foo|bar"
+\`\`\`
+`;
+      const result = renderWikiContent(input, new Set());
+
+      assert.ok(result.html.includes('<code>a * b * c</code>'), 'Gwiazdki w kodzie inline nie mogą być parsowane jako kursywa');
+      assert.ok(result.html.includes('<code>regex $1, $&amp;, $\'</code>') || result.html.includes('<code>regex $1, $&, $\'</code>'),
+        'Symbole $ w kodzie inline nie mogą być uszkadzane przez silnik regex');
+      assert.ok(result.html.includes('<code>[[link-w-kodzie]]</code>'), 'Linki wiki w kodzie inline muszą pozostać dosłownym kodem');
+      assert.ok(result.html.includes('echo &quot;$1&quot;'), 'Blok kodu powinien bezpiecznie zachować $1');
+    });
+
     test('renderuje niebieskie linki dla istniejących stron i czerwone dla brakujących', () => {
       const existingSlugs = new Set(['polska', 'warszawa']);
       const input = `Oto link do [[Polska]] oraz [[Polska|stolicy Polski]]. Brakująca strona to [[Komputer kwantowy]].`;
@@ -122,6 +158,23 @@ describe('1. Parser Wiki (src/wiki-parser.js)', () => {
 
       const addItem = diff.find(d => d.type === 'add' && d.line.includes('Linia 4 dodana'));
       assert.ok(addItem, 'Dodana linia powinna być odnotowana');
+    });
+
+    test('computeLineDiff obsługuje przypadki brzegowe: identyczne teksty, puste teksty, brak starych/nowych linii', () => {
+      assert.deepEqual(computeLineDiff('', ''), []);
+      assert.deepEqual(computeLineDiff(null, null), []);
+
+      const identical = computeLineDiff('A\nB\nC', 'A\nB\nC');
+      assert.equal(identical.length, 3);
+      assert.ok(identical.every(d => d.type === 'same'));
+
+      const allAdded = computeLineDiff('', 'Nowa linia');
+      assert.equal(allAdded.length, 1);
+      assert.equal(allAdded[0].type, 'add');
+
+      const allDeleted = computeLineDiff('Stara linia', '');
+      assert.equal(allDeleted.length, 1);
+      assert.equal(allDeleted[0].type, 'del');
     });
   });
 });
@@ -282,6 +335,83 @@ describe('2. Baza danych (src/db.js)', () => {
     const logs = db.getAuditLogs(20);
     assert.ok(Array.isArray(logs));
     assert.ok(logs.length > 0, 'Powinny być zapisane wpisy w audit_log');
+  });
+
+  test('walidacja unikalności slug i wymaganych pól (title, content) przy tworzeniu i edycji', () => {
+    // Próba utworzenia artykułu z pustym tytułem
+    assert.throws(() => {
+      db.createArticle({ title: '', content: 'Treść' });
+    }, /Tytuł artykułu jest wymagany/);
+
+    // Próba utworzenia artykułu bez treści
+    assert.throws(() => {
+      db.createArticle({ title: 'Test bez treści', content: null });
+    }, /Treść artykułu jest wymagana/);
+
+    // Próba utworzenia duplikatu slug
+    assert.throws(() => {
+      db.createArticle({ title: 'Polska', content: 'Inna treść o Polsce' });
+    }, /już istnieje/);
+
+    // Próba edycji z pustym tytułem
+    assert.throws(() => {
+      db.updateArticle('polska', { title: '   ' });
+    }, /Tytuł artykułu nie może być pusty/);
+
+    // Próba edycji nieistniejącego artykułu
+    assert.throws(() => {
+      db.updateArticle('artykul-ktorego-nie-ma', { content: 'Nowa treść' });
+    }, /nie istnieje/);
+  });
+
+  test('bezpieczne parsowanie uszkodzonego formatu JSON w infobox i categories', () => {
+    // Utwórz artykuł z uszkodzonymi wartościami tekstowymi
+    const created = db.createArticle({
+      title: 'Odporność na błędy danych',
+      slug: 'odpornosc-na-bledy-danych',
+      content: 'Test stabilności',
+      infobox: 'nie-json',
+      categories: 'nie-json-ale-tekst'
+    });
+
+    assert.ok(typeof created.infobox === 'object' && created.infobox !== null);
+    assert.ok(Array.isArray(created.categories));
+    assert.ok(created.categories.includes('nie-json-ale-tekst'));
+
+    // getCategories deduplikuje kategorie dla danego artykułu
+    const cats = db.getCategories();
+    assert.ok(Array.isArray(cats));
+  });
+
+  test('revert do rewizji innego artykułu rzuca błąd (ochrona spójności danych)', () => {
+    const revsPolska = db.getRevisions('polska');
+    assert.ok(revsPolska.length > 0);
+    const polskaRevId = revsPolska[0].id;
+
+    // Próba przywrócenia rewizji z Polski do Zasady WikiKurekk
+    assert.throws(() => {
+      db.revertArticleToRevision('zasady-wikikurekk', polskaRevId, 'admin');
+    }, /Nie odnaleziono rewizji/);
+  });
+
+  test('zarządzanie statusem i usuwaniem nieistniejących artykułów oraz walidacja ról', () => {
+    // updateArticleAdminStatus dla nieistniejącego slug zwraca null
+    const nonExistentStatus = db.updateArticleAdminStatus('brakujacy-artykul', { is_featured: 1 });
+    assert.strictEqual(nonExistentStatus, null);
+
+    // deleteArticle dla nieistniejącego slug zwraca false
+    const nonExistentDelete = db.deleteArticle('brakujacy-artykul');
+    assert.strictEqual(nonExistentDelete, false);
+
+    // Walidacja ról w createUserByAdmin
+    assert.throws(() => {
+      db.createUserByAdmin({ username: 'zly_uzytkownik', password: 'haslo123', role: 'nieistniejaca_rola' });
+    }, /Nieprawidłowa rola/);
+
+    // Walidacja ról w updateUserRole
+    assert.throws(() => {
+      db.updateUserRole(1, 'hacker');
+    }, /Nieprawidłowa rola/);
   });
 });
 
@@ -672,6 +802,207 @@ describe('3. Serwer HTTP API (src/server.js)', () => {
       headers: { 'Authorization': `Bearer ${adminToken}` }
     });
     assert.equal(delRes.status, 200);
+  });
+
+  test('walidacja JSON i kody błędów 400/404 dla żądań do artykułów i rewizji', async () => {
+    // 1. Nieprawidłowy JSON w żądaniu POST
+    const badJsonRes = await apiRequest('/api/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{ to nie jest poprawny json'
+    });
+    assert.equal(badJsonRes.status, 400, 'Nieprawidłowy JSON powinien zwrócić status 400');
+    assert.ok(badJsonRes.json.error);
+
+    // 2. 404 dla nieistniejącego artykułu w GET /api/articles/:slug
+    const notFoundArtRes = await apiRequest('/api/articles/nieistniejacy-artykul-xyz');
+    assert.equal(notFoundArtRes.status, 404);
+
+    // 3. 404 dla nieistniejącego artykułu w revisions
+    const notFoundRevsRes = await apiRequest('/api/articles/nieistniejacy-artykul-xyz/revisions');
+    assert.equal(notFoundRevsRes.status, 404);
+
+    // 4. 404 dla nieistniejącego artykułu w dyskusji GET i POST /talk
+    const notFoundTalkGet = await apiRequest('/api/articles/nieistniejacy-artykul-xyz/talk');
+    assert.equal(notFoundTalkGet.status, 404);
+
+    const notFoundTalkPost = await apiRequest('/api/articles/nieistniejacy-artykul-xyz/talk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: { content: 'Wiadomość do pustki' }
+    });
+    assert.equal(notFoundTalkPost.status, 404);
+
+    // 5. 400 dla pustej wiadomości w dyskusji istniejącego artykułu
+    const emptyTalkRes = await apiRequest('/api/articles/polska/talk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: { content: '   ' }
+    });
+    assert.equal(emptyTalkRes.status, 400);
+
+    // 6. 404 dla revert na nieistniejącym artykule
+    const notFoundRevert = await apiRequest('/api/articles/nieistniejacy-artykul-xyz/revert', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: { revisionId: 1 }
+    });
+    assert.equal(notFoundRevert.status, 404);
+  });
+
+  test('ochrona przed wyciekiem rewizji pomiędzy różnymi artykułami w /api/articles/:slug/diff (400)', async () => {
+    // Pobierz rewizję z artykułu polska i z artykułu javascript
+    const polskaRevs = await apiRequest('/api/articles/polska/revisions');
+    const jsRevs = await apiRequest('/api/articles/javascript/revisions');
+    assert.ok(polskaRevs.json.revisions.length > 0);
+    assert.ok(jsRevs.json.revisions.length > 0);
+
+    const polskaRevId = polskaRevs.json.revisions[0].id;
+    const jsRevId = jsRevs.json.revisions[0].id;
+
+    // Próba porównania rewizji z JavaScript przez ścieżkę artykułu Polska -> 400
+    const leakDiffRes = await apiRequest(`/api/articles/polska/diff?from=${polskaRevId}&to=${jsRevId}`);
+    assert.equal(leakDiffRes.status, 400, 'Diff z rewizją innego artykułu powinien zwrócić 400 Bad Request');
+    assert.ok(leakDiffRes.json.error.includes('Rewizje nie należą'));
+
+    // Błędne identyfikatory from/to (NaN) -> 400
+    const badParamsDiff = await apiRequest('/api/articles/polska/diff?from=abc&to=xyz');
+    assert.equal(badParamsDiff.status, 400);
+  });
+
+  test('walidacja unikalności i wymaganych pól w POST /api/articles (400 i 409) oraz PUT (400 i 404)', async () => {
+    // 1. Brak tytułu w POST /api/articles -> 400
+    const noTitleRes = await apiRequest('/api/articles', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: { content: 'Treść bez tytułu' }
+    });
+    assert.equal(noTitleRes.status, 400);
+
+    // 2. Duplikat tytułu/slug -> 409 Conflict
+    const dupRes = await apiRequest('/api/articles', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: { title: 'Polska', content: 'Kopia' }
+    });
+    assert.equal(dupRes.status, 409, 'Tworzenie duplikatu artykułu powinno zwrócić 409 Conflict');
+
+    // 3. PUT na nieistniejącym artykule -> 404
+    const notFoundPut = await apiRequest('/api/articles/nie-ma-takiego-artykulu', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: { content: 'Nowa treść' }
+    });
+    assert.equal(notFoundPut.status, 404);
+
+    // 4. PUT z pustym tytułem -> 400
+    const emptyTitlePut = await apiRequest('/api/articles/polska', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: { title: '   ' }
+    });
+    assert.equal(emptyTitlePut.status, 400);
+  });
+
+  test('walidacja i statusy w panelu administratora (404, 400, 409)', async () => {
+    // 1. DELETE nieistniejącego artykułu -> 404
+    const delNonExistent = await apiRequest('/api/admin/articles/nie-ma-artykulu-123', {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    assert.equal(delNonExistent.status, 404);
+
+    // 2. DELETE nieistniejącej wiadomości talk -> 404
+    const delNonExistentTalk = await apiRequest('/api/admin/talk/999999', {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    assert.equal(delNonExistentTalk.status, 404);
+
+    // 3. PATCH statusu nieistniejącego artykułu -> 404
+    const patchNonExistentStatus = await apiRequest('/api/admin/articles/nie-ma-artykulu-123/status', {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: { is_featured: 1 }
+    });
+    assert.equal(patchNonExistentStatus.status, 404);
+
+    // 4. POST użytkownika który już istnieje -> 409
+    const dupUser = await apiRequest('/api/admin/users', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: { username: 'admin', password: 'nowehaslo123', role: 'admin' }
+    });
+    assert.equal(dupUser.status, 409);
+
+    // 5. POST użytkownika z nieprawidłową rolą -> 400
+    const badRoleUser = await apiRequest('/api/admin/users', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: { username: 'nowy_tester', password: 'haslo123', role: 'root_super_admin' }
+    });
+    assert.equal(badRoleUser.status, 400);
+
+    // 6. PATCH /api/admin/users/:id - próba odebrania sobie uprawnień admina -> 400
+    const meRes = await apiRequest('/api/auth/me', {
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    const myId = meRes.json.user.id;
+    const demoteSelf = await apiRequest(`/api/admin/users/${myId}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: { role: 'blocked' }
+    });
+    assert.equal(demoteSelf.status, 400, 'Administrator nie może zablokować ani zdemotować samego siebie');
+  });
+
+  test('bezpieczeństwo tokenów i brak wycieku hashy/soli w odpowiedziach API auth oraz blokada path traversal', async () => {
+    // 1. Sprawdzenie czy endpointy logowania i profilu nie zwracają pól hash/salt
+    const loginCheck = await apiRequest('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: { username: 'admin', password: TEST_ADMIN_PASSWORD }
+    });
+    assert.equal(loginCheck.status, 200);
+    assert.strictEqual(loginCheck.json.user.password_hash, undefined);
+    assert.strictEqual(loginCheck.json.user.salt, undefined);
+
+    const meCheck = await apiRequest('/api/auth/me', {
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    assert.strictEqual(meCheck.json.user.password_hash, undefined);
+    assert.strictEqual(meCheck.json.user.salt, undefined);
+
+    // 2. Próba wyjścia poza public/ (path traversal) -> 403 Forbidden
+    const traversal = await apiRequest('/../package.json');
+    assert.equal(traversal.status, 403, 'Path traversal poza katalog public/ musi zwracać 403 Forbidden');
   });
 });
 

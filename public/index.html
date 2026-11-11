@@ -6,13 +6,64 @@
   <title>WikiKurekk – Wolna encyklopedia</title>
   <link rel="stylesheet" href="/styles.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📖</text></svg>">
+  <style>
+    @keyframes viewFadeIn {
+      from { opacity: 0; transform: translateY(3px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .view-fade-in {
+      animation: viewFadeIn 0.2s ease-out;
+    }
+    .toast-warning {
+      background-color: #d97706;
+      color: #ffffff;
+    }
+    .search-suggestion-item.active {
+      background-color: #e2e8f0 !important;
+      outline: none;
+    }
+    html[data-theme="dark"] .search-suggestion-item.active {
+      background-color: #334155 !important;
+    }
+    .skip-link {
+      position: absolute;
+      top: -60px;
+      left: 16px;
+      background: #2563eb;
+      color: #ffffff;
+      padding: 10px 18px;
+      z-index: 9999;
+      border-radius: 4px;
+      text-decoration: none;
+      font-weight: 600;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+      transition: top 0.2s ease;
+    }
+    .skip-link:focus {
+      top: 14px;
+    }
+    .wiki-toc-toggle {
+      background: transparent;
+      border: none;
+      font-family: inherit;
+    }
+    .wiki-toc.collapsed .toc-list {
+      display: none;
+    }
+  </style>
 </head>
 <body>
+  <!-- Link bezpośredniego przejścia do treści (dostępność WCAG) -->
+  <a href="#view-root" class="skip-link">Przejdź do treści głównej</a>
+
+  <!-- Baner ogłoszeniowy na samej górze witryny -->
+  <div id="announcement-banner" class="announcement-banner hidden" role="region" aria-label="Ogłoszenie witryny"></div>
+
   <!-- Główny nagłówek w stylu Wikipedii -->
   <header class="wiki-header">
     <div class="wiki-header-inner">
-      <a href="#/" class="wiki-brand">
-        <div class="wiki-globe">W</div>
+      <a href="#/" class="wiki-brand" aria-label="WikiKurekk - Strona główna">
+        <div class="wiki-globe" aria-hidden="true">W</div>
         <div>
           <span id="site-name-label" class="wiki-title">WikiKurekk</span>
           <span id="site-tagline-label" class="wiki-subtitle">Wolna encyklopedia</span>
@@ -20,17 +71,27 @@
       </a>
 
       <!-- Formularz wyszukiwarki z autouzupełnianiem -->
-      <form id="search-form" class="wiki-search-form" role="search">
-        <input type="search" id="search-input" placeholder="Przeszukaj WikiKurekk..." autocomplete="off" />
-        <button type="submit" id="search-btn">Szukaj</button>
-        <div id="search-suggestions" class="search-suggestions hidden"></div>
+      <form id="search-form" class="wiki-search-form" role="search" aria-label="Wyszukiwarka encyklopedii">
+        <input
+          type="search"
+          id="search-input"
+          placeholder="Przeszukaj WikiKurekk..."
+          autocomplete="off"
+          role="combobox"
+          aria-autocomplete="list"
+          aria-expanded="false"
+          aria-controls="search-suggestions"
+          aria-label="Wpisz szukane hasło"
+        />
+        <button type="submit" id="search-btn" aria-label="Uruchom wyszukiwanie">Szukaj</button>
+        <div id="search-suggestions" class="search-suggestions hidden" role="listbox" aria-label="Podpowiedzi wyszukiwania"></div>
       </form>
 
       <!-- Pasek użytkownika po prawej -->
       <nav class="wiki-user-nav" aria-label="Narzędzia osobiste">
-        <button id="theme-toggle-btn" type="button" class="user-nav-link" title="Przełącz motyw jasny / ciemny">Ciemny motyw</button>
-        <span id="user-badge" class="user-badge hidden"></span>
-        <a href="#/panel" id="nav-admin-top" class="user-nav-link hidden">Panel</a>
+        <button id="theme-toggle-btn" type="button" class="user-nav-link" title="Przełącz motyw jasny / ciemny" aria-label="Przełącz motyw">Ciemny motyw</button>
+        <span id="user-badge" class="user-badge hidden" aria-label="Zalogowany użytkownik"></span>
+        <a href="#/panel" id="nav-admin-top" class="user-nav-link hidden" aria-label="Panel administracyjny">Panel</a>
         <button id="auth-modal-btn" type="button" class="user-nav-link">Zaloguj się</button>
         <button id="register-modal-btn" type="button" class="user-nav-link user-nav-link-accent">Utwórz konto</button>
         <button id="logout-btn" type="button" class="user-nav-link hidden">Wyloguj</button>
@@ -41,8 +102,8 @@
   <!-- Główny układ dwukolumnowy -->
   <div class="wiki-layout">
     <!-- Panel boczny (Sidebar) -->
-    <aside class="wiki-sidebar">
-      <nav class="sidebar-nav">
+    <aside class="wiki-sidebar" aria-label="Nawigacja boczna">
+      <nav class="sidebar-nav" aria-label="Główne działy">
         <div class="sidebar-section-title">Nawigacja</div>
         <a href="#/" class="nav-link" data-route="home">Strona główna</a>
         <a href="#/articles" class="nav-link" data-route="articles">Wszystkie artykuły</a>
@@ -66,20 +127,20 @@
     </aside>
 
     <!-- Główny obszar zawartości -->
-    <main class="wiki-main">
+    <main class="wiki-main" id="main-content">
       <!-- Pasek zakładek artykułu -->
-      <div id="article-tabs-bar" class="article-tabs-bar hidden">
-        <button class="wiki-tab active" data-tab="read" id="tab-btn-read" type="button">Artykuł</button>
-        <button class="wiki-tab" data-tab="talk" id="tab-btn-talk" type="button">Dyskusja <span id="talk-count-badge" class="badge">0</span></button>
-        <button class="wiki-tab" data-tab="edit" id="tab-btn-edit" type="button">Edytuj</button>
-        <button class="wiki-tab" data-tab="history" id="tab-btn-history" type="button">Historia i autorzy <span id="rev-count-badge" class="badge">0</span></button>
+      <div id="article-tabs-bar" class="article-tabs-bar hidden" role="tablist" aria-label="Zakładki artykułu">
+        <button class="wiki-tab active" data-tab="read" id="tab-btn-read" type="button" role="tab" aria-selected="true">Artykuł</button>
+        <button class="wiki-tab" data-tab="talk" id="tab-btn-talk" type="button" role="tab" aria-selected="false">Dyskusja <span id="talk-count-badge" class="badge">0</span></button>
+        <button class="wiki-tab" data-tab="edit" id="tab-btn-edit" type="button" role="tab" aria-selected="false">Edytuj</button>
+        <button class="wiki-tab" data-tab="history" id="tab-btn-history" type="button" role="tab" aria-selected="false">Historia i autorzy <span id="rev-count-badge" class="badge">0</span></button>
       </div>
 
       <!-- Kontener powiadomień Toast -->
       <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
       <!-- Główny węzeł widoków SPA -->
-      <div id="view-root" class="view-root"></div>
+      <div id="view-root" class="view-root" tabindex="-1"></div>
     </main>
   </div>
 

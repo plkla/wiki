@@ -38,7 +38,7 @@ function safeDecode(str) {
 
 function sanitizeUser(user) {
   if (!user) return null;
-  const { password_hash, ...rest } = user;
+  const { password_hash, salt, ...rest } = user;
   return rest;
 }
 
@@ -49,7 +49,9 @@ function parseJsonBody(req) {
       raw += chunk;
       if (raw.length > 5 * 1024 * 1024) {
         req.destroy();
-        reject(new Error('Payload too large'));
+        const err = new Error('Payload too large');
+        err.statusCode = 413;
+        reject(err);
       }
     });
     req.on('end', () => {
@@ -112,6 +114,10 @@ function getAuthUser(req, sessions, db) {
 }
 
 function serveStatic(req, res, pathname) {
+  if (pathname.includes('..') || req.url.includes('..') || req.url.includes('%2e') || req.url.includes('%2E')) {
+    return sendError(res, 403, 'Forbidden');
+  }
+
   let relativePath = pathname;
   if (relativePath === '/' || relativePath === '') {
     relativePath = '/index.html';
@@ -145,12 +151,26 @@ function serveStatic(req, res, pathname) {
       res.end();
       return;
     }
-    fs.createReadStream(filePath).pipe(res);
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => {
+      if (!res.headersSent) {
+        sendError(res, 500, 'Błąd odczytu pliku.');
+      } else {
+        res.end();
+      }
+    });
+    stream.pipe(res);
     return;
   }
 
   if (pathname.startsWith('/api')) {
     return sendError(res, 404, 'Endpoint nie istnieje.');
+  }
+
+  // Jeśli zażądano pliku ze znanym rozszerzeniem zasobu (np. .js, .css, .json, .png), który nie istnieje na dysku
+  const requestedExt = path.extname(pathname);
+  if (requestedExt && requestedExt !== '.html') {
+    return sendError(res, 404, 'Plik nie istnieje.');
   }
 
   const indexPath = path.join(PUBLIC_DIR, 'index.html');
@@ -165,7 +185,15 @@ function serveStatic(req, res, pathname) {
       res.end();
       return;
     }
-    fs.createReadStream(indexPath).pipe(res);
+    const stream = fs.createReadStream(indexPath);
+    stream.on('error', () => {
+      if (!res.headersSent) {
+        sendError(res, 500, 'Błąd odczytu pliku.');
+      } else {
+        res.end();
+      }
+    });
+    stream.pipe(res);
   } else {
     const fallbackHtml = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>WikiKurekk</title></head><body><div id="view-root">WikiKurekk</div></body></html>';
     res.writeHead(200, {
@@ -211,6 +239,9 @@ function createWikiServer({ dbPath } = {}) {
       try {
         body = await parseJsonBody(req);
       } catch (err) {
+        if (err.statusCode === 413 || err.message === 'Payload too large') {
+          return sendError(res, 413, 'Żądanie przekracza dopuszczalny limit wielkości (5 MB).');
+        }
         return sendError(res, 400, 'Nieprawidłowe dane JSON w treści żądania.');
       }
     }
@@ -253,7 +284,7 @@ function createWikiServer({ dbPath } = {}) {
       // 2. Auth routes
       if (pathname === '/api/auth/login' && req.method === 'POST') {
         const { username, password } = body;
-        if (!username || !password) {
+        if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
           return sendError(res, 400, 'Wymagana nazwa użytkownika i hasło.');
         }
         const user = db.authenticateUser(username, password);
@@ -276,8 +307,17 @@ function createWikiServer({ dbPath } = {}) {
         if (typeof username !== 'string' || username.trim().length < 2) {
           return sendError(res, 400, 'Nazwa użytkownika musi zawierać co najmniej 2 znaki.');
         }
+        if (username.trim().length > 50) {
+          return sendError(res, 400, 'Nazwa użytkownika nie może przekraczać 50 znaków.');
+        }
         if (typeof password !== 'string' || password.length < 3) {
           return sendError(res, 400, 'Hasło musi zawierać co najmniej 3 znaki.');
+        }
+        if (password.length > 256) {
+          return sendError(res, 400, 'Hasło nie może przekraczać 256 znaków.');
+        }
+        if (bio !== undefined && bio !== null && (typeof bio !== 'string' || bio.length > 1000)) {
+          return sendError(res, 400, 'Biogram nie może przekraczać 1000 znaków.');
         }
         const existing = db.getUserByUsername ? db.getUserByUsername(username.trim()) : null;
         if (existing) {
@@ -320,10 +360,12 @@ function createWikiServer({ dbPath } = {}) {
       if (pathname === '/api/articles' && req.method === 'GET') {
         const isAdmin = currentUser && currentUser.role === 'admin';
         const includeUnpublished = query.includeUnpublished === '1' && isAdmin;
+        const limit = query.limit ? parseInt(query.limit, 10) : undefined;
         const articles = db.listArticles({
           q: query.q,
           category: query.category,
-          includeUnpublished
+          includeUnpublished,
+          limit
         });
         return sendJson(res, 200, { articles });
       }
@@ -352,8 +394,11 @@ function createWikiServer({ dbPath } = {}) {
         }
 
         const { title, slug: customSlug, summary, content, infobox, categories, edit_comment } = body;
-        if (!title || !title.trim()) {
+        if (!title || typeof title !== 'string' || !title.trim()) {
           return sendError(res, 400, 'Tytuł jest wymagany.');
+        }
+        if (title.trim().length > 255) {
+          return sendError(res, 400, 'Tytuł nie może przekraczać 255 znaków.');
         }
         if (content === undefined || content === null) {
           return sendError(res, 400, 'Treść artykułu jest wymagana.');
@@ -370,8 +415,8 @@ function createWikiServer({ dbPath } = {}) {
             slug: finalSlug,
             summary: summary || '',
             content,
-            infobox: typeof infobox === 'object' ? JSON.stringify(infobox) : (infobox || '{}'),
-            categories: Array.isArray(categories) ? categories.join(', ') : (categories || ''),
+            infobox: typeof infobox === 'object' ? infobox : (infobox || '{}'),
+            categories: Array.isArray(categories) ? categories : (categories || []),
             editor,
             edit_comment: edit_comment || 'Utworzenie artykułu'
           });
@@ -384,7 +429,8 @@ function createWikiServer({ dbPath } = {}) {
             toc
           });
         } catch (err) {
-          return sendError(res, 400, err.message || 'Błąd podczas tworzenia artykułu.');
+          const statusCode = (err.message && err.message.includes('już istnieje')) ? 409 : 400;
+          return sendError(res, statusCode, err.message || 'Błąd podczas tworzenia artykułu.');
         }
       }
 
@@ -402,8 +448,9 @@ function createWikiServer({ dbPath } = {}) {
 
       // 6. GET /api/recent-changes
       if (pathname === '/api/recent-changes' && req.method === 'GET') {
+        const isAdmin = currentUser && currentUser.role === 'admin';
         const limit = parseInt(query.limit, 10) || 50;
-        const changes = db.getRecentChanges(limit);
+        const changes = db.getRecentChanges(limit, { includeUnpublished: isAdmin });
         return sendJson(res, 200, { changes });
       }
 
@@ -461,8 +508,17 @@ function createWikiServer({ dbPath } = {}) {
           if (!existing) {
             return sendError(res, 404, 'Artykuł nie został odnaleziony.');
           }
+          if (existing.is_published === 0 && (!currentUser || currentUser.role !== 'admin')) {
+            return sendError(res, 404, 'Artykuł nie został odnaleziony.');
+          }
           if (existing.is_locked && (!currentUser || currentUser.role !== 'admin')) {
             return sendError(res, 403, 'Artykuł jest zabezpieczony przed edycją.');
+          }
+          if (body.title !== undefined && (typeof body.title !== 'string' || !body.title.trim())) {
+            return sendError(res, 400, 'Tytuł artykułu nie może być pusty.');
+          }
+          if (body.content !== undefined && (body.content === null || typeof body.content !== 'string' && typeof body.content !== 'number')) {
+            return sendError(res, 400, 'Treść artykułu nie może być pusta.');
           }
 
           const editor = currentUser ? currentUser.username : 'Anonim';
@@ -471,8 +527,8 @@ function createWikiServer({ dbPath } = {}) {
               title: body.title !== undefined ? body.title : existing.title,
               summary: body.summary !== undefined ? body.summary : existing.summary,
               content: body.content !== undefined ? body.content : existing.content,
-              infobox: typeof body.infobox === 'object' ? JSON.stringify(body.infobox) : (body.infobox !== undefined ? body.infobox : existing.infobox),
-              categories: Array.isArray(body.categories) ? body.categories.join(', ') : (body.categories !== undefined ? body.categories : existing.categories),
+              infobox: typeof body.infobox === 'object' ? body.infobox : (body.infobox !== undefined ? body.infobox : existing.infobox),
+              categories: Array.isArray(body.categories) ? body.categories : (body.categories !== undefined ? body.categories : existing.categories),
               editor,
               edit_comment: body.edit_comment || 'Edycja artykułu'
             });
@@ -491,7 +547,8 @@ function createWikiServer({ dbPath } = {}) {
 
         // GET /api/articles/:slug/revisions
         if (subRoute === 'revisions' && req.method === 'GET') {
-          const article = db.getArticleBySlug(slug, { includeUnpublished: true });
+          const isAdmin = currentUser && currentUser.role === 'admin';
+          const article = db.getArticleBySlug(slug, { includeUnpublished: isAdmin });
           if (!article) {
             return sendError(res, 404, 'Artykuł nie został odnaleziony.');
           }
@@ -504,15 +561,23 @@ function createWikiServer({ dbPath } = {}) {
 
         // GET /api/articles/:slug/diff?from=:id1&to=:id2
         if (subRoute === 'diff' && req.method === 'GET') {
+          const isAdmin = currentUser && currentUser.role === 'admin';
+          const article = db.getArticleBySlug(slug, { includeUnpublished: isAdmin });
+          if (!article) {
+            return sendError(res, 404, 'Artykuł nie został odnaleziony.');
+          }
           const fromId = parseInt(query.from, 10);
           const toId = parseInt(query.to, 10);
-          if (!fromId || !toId) {
+          if (isNaN(fromId) || isNaN(toId) || fromId <= 0 || toId <= 0) {
             return sendError(res, 400, 'Wymagane poprawne parametry from i to.');
           }
           const fromRev = db.getRevisionById(fromId);
           const toRev = db.getRevisionById(toId);
           if (!fromRev || !toRev) {
             return sendError(res, 404, 'Nie znaleziono wskazanych rewizji.');
+          }
+          if (fromRev.article_slug.toLowerCase() !== slug.toLowerCase() || toRev.article_slug.toLowerCase() !== slug.toLowerCase()) {
+            return sendError(res, 400, 'Rewizje nie należą do wskazanego artykułu.');
           }
           const diff = computeLineDiff(fromRev.content, toRev.content);
           return sendJson(res, 200, { fromRev, toRev, diff });
@@ -534,13 +599,16 @@ function createWikiServer({ dbPath } = {}) {
           if (!existing) {
             return sendError(res, 404, 'Artykuł nie został odnaleziony.');
           }
+          if (existing.is_published === 0 && (!currentUser || currentUser.role !== 'admin')) {
+            return sendError(res, 404, 'Artykuł nie został odnaleziony.');
+          }
           if (existing.is_locked && (!currentUser || currentUser.role !== 'admin')) {
             return sendError(res, 403, 'Artykuł jest zabezpieczony przed edycją.');
           }
 
           const revisionId = parseInt(body.revisionId, 10);
-          if (!revisionId) {
-            return sendError(res, 400, 'Wymagany parametr revisionId.');
+          if (!revisionId || isNaN(revisionId) || revisionId <= 0) {
+            return sendError(res, 400, 'Wymagany poprawny parametr revisionId.');
           }
 
           const actor = currentUser ? currentUser.username : 'Anonim';
@@ -563,23 +631,36 @@ function createWikiServer({ dbPath } = {}) {
 
         // GET /api/articles/:slug/talk
         if (subRoute === 'talk' && req.method === 'GET') {
+          const isAdmin = currentUser && currentUser.role === 'admin';
+          const article = db.getArticleBySlug(slug, { includeUnpublished: isAdmin });
+          if (!article) {
+            return sendError(res, 404, 'Artykuł nie został odnaleziony.');
+          }
           const messages = db.getTalkMessages(slug);
           return sendJson(res, 200, { messages });
         }
 
         // POST /api/articles/:slug/talk
         if (subRoute === 'talk' && req.method === 'POST') {
+          const isAdmin = currentUser && currentUser.role === 'admin';
+          const article = db.getArticleBySlug(slug, { includeUnpublished: isAdmin });
+          if (!article) {
+            return sendError(res, 404, 'Artykuł nie został odnaleziony.');
+          }
           if (currentUser && currentUser.role === 'blocked') {
             return sendError(res, 403, 'Konto zablokowane.');
           }
           const { content, author: customAuthor } = body;
-          if (!content || !content.trim()) {
+          if (!content || typeof content !== 'string' || !content.trim()) {
             return sendError(res, 400, 'Treść wiadomości nie może być pusta.');
+          }
+          if (content.trim().length > 5000) {
+            return sendError(res, 400, 'Treść wiadomości nie może przekraczać 5000 znaków.');
           }
 
           const author = currentUser
             ? currentUser.username
-            : (customAuthor && customAuthor.trim() ? customAuthor.trim() : 'Anonim');
+            : (customAuthor && typeof customAuthor === 'string' && customAuthor.trim() ? customAuthor.trim() : 'Anonim');
 
           try {
             const message = db.addTalkMessage(slug, {
@@ -639,7 +720,10 @@ function createWikiServer({ dbPath } = {}) {
         const articleDeleteMatch = pathname.match(/^\/api\/admin\/articles\/([^/]+)$/);
         if (articleDeleteMatch && req.method === 'DELETE') {
           const slug = safeDecode(articleDeleteMatch[1]);
-          db.deleteArticle(slug, currentUser.username);
+          const deleted = db.deleteArticle(slug, currentUser.username);
+          if (!deleted) {
+            return sendError(res, 404, 'Artykuł nie został odnaleziony.');
+          }
           return sendJson(res, 200, { deleted: true, slug });
         }
 
@@ -648,6 +732,18 @@ function createWikiServer({ dbPath } = {}) {
           const { username, password, role, bio } = body;
           if (!username || !password) {
             return sendError(res, 400, 'Nazwa użytkownika i hasło są wymagane.');
+          }
+          if (typeof username !== 'string' || username.trim().length < 2) {
+            return sendError(res, 400, 'Nazwa użytkownika musi mieć co najmniej 2 znaki.');
+          }
+          if (username.trim().length > 50) {
+            return sendError(res, 400, 'Nazwa użytkownika nie może przekraczać 50 znaków.');
+          }
+          if (typeof password !== 'string' || password.length < 3) {
+            return sendError(res, 400, 'Hasło musi mieć co najmniej 3 znaki.');
+          }
+          if (password.length > 256) {
+            return sendError(res, 400, 'Hasło nie może przekraczać 256 znaków.');
           }
           try {
             const user = db.createUserByAdmin({
@@ -658,7 +754,8 @@ function createWikiServer({ dbPath } = {}) {
             }, currentUser.username);
             return sendJson(res, 201, { user: sanitizeUser(user) });
           } catch (err) {
-            return sendError(res, 400, err.message || 'Błąd podczas tworzenia użytkownika.');
+            const statusCode = (err.message && err.message.includes('już istnieje')) ? 409 : 400;
+            return sendError(res, statusCode, err.message || 'Błąd podczas tworzenia użytkownika.');
           }
         }
 
@@ -666,9 +763,15 @@ function createWikiServer({ dbPath } = {}) {
         const userPatchMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)$/);
         if (userPatchMatch && req.method === 'PATCH') {
           const targetId = parseInt(userPatchMatch[1], 10);
+          if (isNaN(targetId) || targetId <= 0) {
+            return sendError(res, 400, 'Nieprawidłowe ID użytkownika.');
+          }
           const { role } = body;
           if (!role) {
             return sendError(res, 400, 'Brak nowej roli użytkownika.');
+          }
+          if (currentUser && currentUser.id === targetId && role !== 'admin') {
+            return sendError(res, 400, 'Nie można odebrać sobie uprawnień administratora.');
           }
           try {
             const user = db.updateUserRole(targetId, role, currentUser.username);
@@ -685,16 +788,25 @@ function createWikiServer({ dbPath } = {}) {
         const talkDeleteMatch = pathname.match(/^\/api\/admin\/talk\/([^/]+)$/);
         if (talkDeleteMatch && req.method === 'DELETE') {
           const talkId = parseInt(talkDeleteMatch[1], 10);
-          db.deleteTalkMessage(talkId, currentUser.username);
+          if (isNaN(talkId) || talkId <= 0) {
+            return sendError(res, 400, 'Nieprawidłowe ID wiadomości.');
+          }
+          const deleted = db.deleteTalkMessage(talkId, currentUser.username);
+          if (!deleted) {
+            return sendError(res, 404, 'Wiadomość dyskusji nie została odnaleziona.');
+          }
           return sendJson(res, 200, { deleted: true });
         }
 
         // PUT /api/admin/settings
         if (pathname === '/api/admin/settings' && req.method === 'PUT') {
           const { site_name, site_tagline, announcement_banner, allow_anonymous_edits } = body;
+          if (site_name !== undefined && (typeof site_name !== 'string' || !site_name.trim())) {
+            return sendError(res, 400, 'Nazwa witryny nie może być pusta.');
+          }
           try {
             const updatedSettings = db.updateSettings({
-              site_name,
+              site_name: site_name !== undefined ? site_name.trim() : undefined,
               site_tagline,
               announcement_banner,
               allow_anonymous_edits: allow_anonymous_edits !== undefined ? String(allow_anonymous_edits) : undefined

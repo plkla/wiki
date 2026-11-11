@@ -30,6 +30,9 @@
     theme: localStorage.getItem('wiki_theme') || 'light'
   };
 
+  // Referencja do ostatniego elementu, który otworzył modal (dla dostępności)
+  let lastFocusedElementBeforeModal = null;
+
   // --- Motyw jasny / ciemny ---
   function applyTheme(theme) {
     const clean = theme === 'dark' ? 'dark' : 'light';
@@ -47,6 +50,17 @@
     return Boolean(state.currentUser && (state.currentUser.role === 'admin' || state.currentUser.role === 'editor'));
   }
 
+  // Aktualizacja tytułu zakładki w przeglądarce
+  function setPageTitle(subTitle = '') {
+    const siteName = (state.settings && state.settings.site_name) || 'WikiKurekk';
+    if (subTitle) {
+      document.title = `${subTitle} – ${siteName}`;
+    } else {
+      const tagline = (state.settings && state.settings.site_tagline) || 'Wolna encyklopedia';
+      document.title = `${siteName} – ${tagline}`;
+    }
+  }
+
   // --- Pomocnicze funkcje tekstowe i formatowania ---
   function escapeHtml(str) {
     if (str === null || str === undefined) return '';
@@ -61,7 +75,7 @@
   function formatDate(dateStr) {
     if (!dateStr) return '';
     const d = new Date(dateStr);
-    if (isNaN(d.getTime())) return dateStr;
+    if (isNaN(d.getTime())) return String(dateStr);
     return d.toLocaleString('pl-PL', {
       year: 'numeric',
       month: '2-digit',
@@ -69,6 +83,16 @@
       hour: '2-digit',
       minute: '2-digit'
     });
+  }
+
+  // Bezpieczna walidacja URL obrazu
+  function sanitizeImageUrl(url) {
+    if (!url || typeof url !== 'string') return '';
+    const clean = url.trim();
+    if (/^(https?:\/\/|\/|data:image\/)/i.test(clean)) {
+      return clean;
+    }
+    return '';
   }
 
   // --- Pomocnicze funkcje kategorii ---
@@ -80,6 +104,27 @@
     return (c && typeof c === 'object' && typeof c.count === 'number') ? c.count : null;
   }
 
+  // Bezpieczne parsowanie listy kategorii z obiektu artykułu
+  function parseCategories(catData) {
+    if (!catData) return [];
+    if (Array.isArray(catData)) {
+      return catData.map(c => getCatName(c)).filter(Boolean);
+    }
+    if (typeof catData === 'string') {
+      const trimmed = catData.trim();
+      if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            return parsed.map(c => getCatName(c)).filter(Boolean);
+          }
+        } catch {}
+      }
+      return trimmed.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    return [];
+  }
+
   // --- System powiadomień Toast ---
   function showToast(message, type = 'info') {
     const container = document.getElementById('toast-container');
@@ -87,7 +132,13 @@
 
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
-    
+    toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+
+    if (type === 'warning') {
+      toast.style.backgroundColor = '#d97706';
+      toast.style.color = '#ffffff';
+    }
+
     const icons = {
       success: '✅',
       error: '❌',
@@ -97,9 +148,9 @@
     const icon = icons[type] || 'ℹ️';
 
     toast.innerHTML = `
-      <span class="toast-icon">${icon}</span>
+      <span class="toast-icon" aria-hidden="true">${icon}</span>
       <span class="toast-message">${escapeHtml(message)}</span>
-      <button class="toast-close" type="button" aria-label="Zamknij">&times;</button>
+      <button class="toast-close" type="button" aria-label="Zamknij powiadomienie">&times;</button>
     `;
 
     const closeBtn = toast.querySelector('.toast-close');
@@ -110,12 +161,12 @@
       toast.classList.add('toast-fade-out');
       setTimeout(() => {
         if (toast.parentNode) toast.parentNode.removeChild(toast);
-      }, 300);
+      }, 250);
     };
 
     closeBtn.addEventListener('click', removeToast);
     container.appendChild(toast);
-    timer = setTimeout(removeToast, 3500);
+    timer = setTimeout(removeToast, 3800);
   }
 
   // Eksport globalny showToast
@@ -124,7 +175,7 @@
   // --- Komunikacja z API ---
   async function api(path, options = {}) {
     const headers = Object.assign({}, options.headers || {});
-    
+
     if (options.body && typeof options.body === 'object' && !(options.body instanceof FormData)) {
       headers['Content-Type'] = 'application/json';
       options.body = JSON.stringify(options.body);
@@ -177,6 +228,19 @@
     const siteTaglineEl = document.getElementById('site-tagline-label');
     if (siteNameEl) siteNameEl.textContent = state.settings.site_name || 'WikiKurekk';
     if (siteTaglineEl) siteTaglineEl.textContent = state.settings.site_tagline || 'Wolna encyklopedia';
+
+    // Baner ogłoszeniowy na samej górze witryny
+    const bannerEl = document.getElementById('announcement-banner');
+    if (bannerEl) {
+      const bannerText = (state.settings && state.settings.announcement_banner) ? state.settings.announcement_banner.trim() : '';
+      if (bannerText) {
+        bannerEl.textContent = bannerText;
+        bannerEl.classList.remove('hidden');
+      } else {
+        bannerEl.textContent = '';
+        bannerEl.classList.add('hidden');
+      }
+    }
 
     // Odznaka użytkownika i przyciski auth
     const userBadgeEl = document.getElementById('user-badge');
@@ -283,15 +347,31 @@
     const tabHistory = document.getElementById('tab-btn-history');
 
     const allTabs = [tabRead, tabTalk, tabEdit, tabHistory].filter(Boolean);
-    allTabs.forEach(t => t.classList.remove('active'));
+    allTabs.forEach(t => {
+      t.classList.remove('active');
+      t.setAttribute('aria-selected', 'false');
+    });
+
     if (tabEdit) {
       tabEdit.classList.toggle('hidden', !canEditWiki());
     }
 
-    if (activeTab === 'read' && tabRead) tabRead.classList.add('active');
-    if (activeTab === 'talk' && tabTalk) tabTalk.classList.add('active');
-    if (activeTab === 'edit' && tabEdit) tabEdit.classList.add('active');
-    if (activeTab === 'history' && tabHistory) tabHistory.classList.add('active');
+    if (activeTab === 'read' && tabRead) {
+      tabRead.classList.add('active');
+      tabRead.setAttribute('aria-selected', 'true');
+    }
+    if (activeTab === 'talk' && tabTalk) {
+      tabTalk.classList.add('active');
+      tabTalk.setAttribute('aria-selected', 'true');
+    }
+    if (activeTab === 'edit' && tabEdit) {
+      tabEdit.classList.add('active');
+      tabEdit.setAttribute('aria-selected', 'true');
+    }
+    if (activeTab === 'history' && tabHistory) {
+      tabHistory.classList.add('active');
+      tabHistory.setAttribute('aria-selected', 'true');
+    }
 
     // Aktualizacja liczników badge
     const revBadge = document.getElementById('rev-count-badge');
@@ -318,8 +398,9 @@
     if (!data || typeof data !== 'object') return '';
 
     const title = data.title || fallbackTitle;
-    const image = data.image || '';
-    const items = data.items || data;
+    const rawImage = data.image || '';
+    const image = sanitizeImageUrl(rawImage);
+    const items = (data.items && typeof data.items === 'object') ? data.items : data;
 
     let rowsHtml = '';
     for (const [key, val] of Object.entries(items)) {
@@ -337,9 +418,9 @@
     if (!rowsHtml && !image) return '';
 
     return `
-      <aside class="wiki-infobox">
-        ${title ? `<div class="infobox-title">${escapeHtml(title)}</div>` : ''}
-        ${image ? `<div class="infobox-image"><img src="${escapeHtml(image)}" alt="${escapeHtml(title)}" /></div>` : ''}
+      <aside class="wiki-infobox" aria-label="Informacje encyklopedyczne">
+        ${title ? `<div class="wiki-infobox-header infobox-title">${escapeHtml(title)}</div>` : ''}
+        ${image ? `<div class="wiki-infobox-image infobox-image"><img src="${escapeHtml(image)}" alt="${escapeHtml(title)}" loading="lazy" /></div>` : ''}
         <table class="infobox-table">
           <tbody>
             ${rowsHtml}
@@ -353,9 +434,12 @@
   function renderToc(toc) {
     if (!toc || !Array.isArray(toc) || toc.length === 0) return '';
     return `
-      <nav class="wiki-toc" aria-label="Spis treści">
-        <div class="toc-title">Spis treści</div>
-        <ul class="toc-list">
+      <nav class="wiki-toc" id="article-toc" aria-label="Spis treści">
+        <div class="wiki-toc-header">
+          <strong class="wiki-toc-title">Spis treści</strong>
+          <button type="button" class="wiki-toc-toggle link-btn" id="toc-toggle-btn" aria-expanded="true" aria-controls="toc-list-ul">[ukryj]</button>
+        </div>
+        <ul class="toc-list" id="toc-list-ul">
           ${toc.map(item => `
             <li class="toc-item toc-level-${item.level || 2}">
               <a href="#${escapeHtml(item.id)}" class="toc-link">${escapeHtml(item.text)}</a>
@@ -366,25 +450,12 @@
     `;
   }
 
-  // --- Renderowanie sekcji przypisów ---
-  function renderReferences(references) {
-    if (!references || !Array.isArray(references) || references.length === 0) return '';
-    return `
-      <section class="wiki-references">
-        <h3 id="sekcja-przypisy">Przypisy i źródła</h3>
-        <ol class="references-list">
-          ${references.map((ref, idx) => `
-            <li id="cite_note-${idx + 1}">${escapeHtml(ref)}</li>
-          `).join('')}
-        </ol>
-      </section>
-    `;
-  }
-
   // --- WIDOK 1: Strona Główna (#/) ---
   async function renderHomePage() {
     updateArticleTabs(null);
+    setPageTitle();
     const viewRoot = document.getElementById('view-root');
+    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie encyklopedii...</div>';
 
     try {
@@ -395,6 +466,7 @@
       state.allSlugs = data.allSlugs || state.allSlugs;
       if (data.currentUser !== undefined) state.currentUser = data.currentUser;
       updateHeaderAndSidebar();
+      setPageTitle();
 
       const featured = data.featuredArticle;
       const recentArticles = data.recentArticles || [];
@@ -422,7 +494,7 @@
                 <span class="welcome-sep">&middot;</span>
                 <a href="#/categories">Kategorie</a>
                 <span class="welcome-sep">&middot;</span>
-                <button type="button" id="main-random-btn" class="welcome-link-btn">Losowy artykuł</button>
+                <button type="button" id="main-random-btn" class="welcome-link-btn link-btn">Losowy artykuł</button>
                 ${canEditWiki() ? `<span class="welcome-sep">&middot;</span><a href="#/new">Utwórz hasło</a>` : ''}
               </div>
             </div>
@@ -435,18 +507,18 @@
             <section class="main-card card-featured">
               <div class="card-header">
                 <h2>Artykuł wyróżniony</h2>
-                ${featured ? `<a href="#/wiki/${featured.slug}" class="card-header-link">${escapeHtml(featured.title)} &rarr;</a>` : ''}
+                ${featured ? `<a href="#/wiki/${encodeURIComponent(featured.slug)}" class="card-header-link">${escapeHtml(featured.title)} &rarr;</a>` : ''}
               </div>
               <div class="card-body clearfix">
                 ${featured ? `
                   ${renderInfobox(featured.infobox, featured.title)}
-                  <h3 class="featured-article-heading"><a href="#/wiki/${featured.slug}">${escapeHtml(featured.title)}</a></h3>
+                  <h3 class="featured-article-heading"><a href="#/wiki/${encodeURIComponent(featured.slug)}">${escapeHtml(featured.title)}</a></h3>
                   <p class="featured-summary">${escapeHtml(featured.summary || '')}</p>
                   <div class="featured-content-snippet">
                     ${featured.renderedHtml ? (featured.renderedHtml.split(/<h[23]\b/i)[0] || '') : ''}
                   </div>
                   <div class="card-footer-link">
-                    <a href="#/wiki/${featured.slug}">Czytaj cały artykuł &rarr;</a>
+                    <a href="#/wiki/${encodeURIComponent(featured.slug)}">Czytaj cały artykuł &rarr;</a>
                   </div>
                 ` : `
                   <p>Obecnie żaden artykuł nie jest oznaczony jako wyróżniony.</p>
@@ -462,7 +534,7 @@
               </div>
               <div class="card-body">
                 <div class="categories-index-list">
-                  ${state.categories.map(cat => {
+                  ${state.categories.length === 0 ? '<p>Brak zdefiniowanych kategorii.</p>' : state.categories.map(cat => {
                     const name = getCatName(cat);
                     const count = getCatCount(cat);
                     return `
@@ -496,12 +568,12 @@
               </div>
               <div class="card-body">
                 <ul class="recent-list">
-                  ${recentArticles.slice(0, 6).map(art => {
+                  ${recentArticles.length === 0 ? '<li class="recent-item"><em>Brak ostatnich zmian</em></li>' : recentArticles.slice(0, 6).map(art => {
                     const slug = art.slug || art.article_slug;
                     const title = art.title || slug;
                     return `
                       <li class="recent-item">
-                        <a href="#/wiki/${slug}" class="recent-title">${escapeHtml(title)}</a>
+                        <a href="#/wiki/${encodeURIComponent(slug)}" class="recent-title">${escapeHtml(title)}</a>
                         <span class="recent-meta">${formatDate(art.updated_at || art.created_at)}</span>
                       </li>
                     `;
@@ -521,7 +593,14 @@
         mainRandomBtn.addEventListener('click', async () => {
           try {
             const r = await api('/api/articles/random');
-            if (r.slug) window.location.hash = `#/wiki/${r.slug}`;
+            if (r.slug) {
+              const targetHash = `#/wiki/${encodeURIComponent(r.slug)}`;
+              if (window.location.hash === targetHash) {
+                handleRoute();
+              } else {
+                window.location.hash = targetHash;
+              }
+            }
           } catch (e) {
             showToast(e.message, 'error');
           }
@@ -529,27 +608,33 @@
       }
 
     } catch (err) {
-      viewRoot.innerHTML = `<div class="wiki-error">Nie udało się załadować danych strony głównej: ${escapeHtml(err.message)}</div>`;
+      viewRoot.innerHTML = `
+        <div class="wiki-error">
+          <p>Nie udało się załadować danych strony głównej: ${escapeHtml(err.message)}</p>
+          <button type="button" class="btn btn-secondary" onclick="window.wikiApp.handleRoute()">Spróbuj ponownie</button>
+        </div>
+      `;
     }
   }
 
   // --- WIDOK 2: Artykuł (#/wiki/:slug) ---
   async function renderArticleView(slug) {
     const viewRoot = document.getElementById('view-root');
+    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie artykułu...</div>';
 
     try {
       const data = await api(`/api/articles/${encodeURIComponent(slug)}`);
       const art = data.article;
+      setPageTitle(art.title);
       updateArticleTabs(slug, 'read', data.revisionsCount, data.talkCount);
 
       const badgesHtml = [];
-      if (art.is_locked) badgesHtml.push('<span class="status-pill badge-locked">🔒 Zabezpieczony</span>');
-      if (art.is_featured) badgesHtml.push('<span class="status-pill badge-featured">⭐ Wyróżniony</span>');
-      if (!art.is_published) badgesHtml.push('<span class="status-pill badge-unpublished">⚠️ Szkic (Nieopublikowany)</span>');
+      if (art.is_locked) badgesHtml.push('<span class="status-pill locked badge-locked">🔒 Zabezpieczony</span>');
+      if (art.is_featured) badgesHtml.push('<span class="status-pill featured badge-featured">⭐ Wyróżniony</span>');
+      if (!art.is_published) badgesHtml.push('<span class="status-pill draft badge-unpublished">⚠️ Szkic (Nieopublikowany)</span>');
 
-      const rawCats = Array.isArray(art.categories) ? art.categories : (art.categories ? JSON.parse(art.categories) : []);
-      const cats = (Array.isArray(rawCats) ? rawCats : []).map(c => getCatName(c)).filter(Boolean);
+      const cats = parseCategories(art.categories);
 
       viewRoot.innerHTML = `
         <article class="wiki-article">
@@ -561,7 +646,7 @@
             <div class="wiki-article-meta">
               <span>👁️ Wyświetlenia: <strong>${art.views || 0}</strong></span>
               <span>🕒 Ostatnia modyfikacja: <strong>${formatDate(art.updated_at)}</strong></span>
-              ${art.editor ? `<span>✍️ Autor edycji: <strong>${escapeHtml(art.editor)}</strong></span>` : ''}
+              ${art.editor ? `<span>✍️ Ostatni autor: <strong>${escapeHtml(art.editor)}</strong></span>` : ''}
             </div>
             ${art.summary ? `<p class="wiki-article-summary"><em>${escapeHtml(art.summary)}</em></p>` : ''}
           </header>
@@ -575,14 +660,11 @@
           </div>
 
           ${cats && cats.length > 0 ? `
-            <footer class="wiki-categories-bar">
-              <span class="cat-label">Kategorie:</span>
-              <ul class="cat-list">
-                ${cats.map(c => {
-                  const cName = getCatName(c);
-                  return `<li><a href="#/categories/${encodeURIComponent(cName)}">${escapeHtml(cName)}</a></li>`;
-                }).join('')}
-              </ul>
+            <footer class="wiki-categories-bar" aria-label="Kategorie artykułu">
+              <span class="wiki-categories-label cat-label">Kategorie:</span>
+              ${cats.map(cName => `
+                <a href="#/categories/${encodeURIComponent(cName)}" class="wiki-category-tag">${escapeHtml(cName)}</a>
+              `).join(' ')}
             </footer>
           ` : ''}
         </article>
@@ -591,6 +673,7 @@
     } catch (err) {
       updateArticleTabs(null);
       if (err.status === 404) {
+        setPageTitle('Strona nie znaleziona');
         viewRoot.innerHTML = `
           <div class="wiki-not-found">
             <h2>Strona nie została odnaleziona</h2>
@@ -604,7 +687,13 @@
           </div>
         `;
       } else {
-        viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania artykułu: ${escapeHtml(err.message)}</div>`;
+        setPageTitle('Błąd');
+        viewRoot.innerHTML = `
+          <div class="wiki-error">
+            <p>Błąd wczytywania artykułu: ${escapeHtml(err.message)}</p>
+            <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
+          </div>
+        `;
       }
     }
   }
@@ -613,10 +702,12 @@
   async function renderArticleEditor(slug = null, initialTitle = '') {
     const isNew = !slug;
     const viewRoot = document.getElementById('view-root');
+    viewRoot.classList.add('view-fade-in');
 
     // Sprawdzenie uprawnień edycji: tylko admin i editor
     if (!canEditWiki()) {
       updateArticleTabs(slug || null, 'read');
+      setPageTitle('Wymagane uprawnienia redaktora');
       viewRoot.innerHTML = `
         <div class="admin-auth-guard">
           <h2>🔒 Edycja dostępna dla redaktorów</h2>
@@ -645,6 +736,7 @@
       try {
         const data = await api(`/api/articles/${encodeURIComponent(slug)}?noView=1`);
         currentArticle = data.article;
+        setPageTitle(`Edycja: ${currentArticle.title}`);
         updateArticleTabs(slug, 'edit', data.revisionsCount, data.talkCount);
       } catch (err) {
         showToast(err.message, 'error');
@@ -652,6 +744,7 @@
         return;
       }
     } else {
+      setPageTitle(initialTitle ? `Nowy artykuł: ${initialTitle}` : 'Tworzenie nowego artykułu');
       updateArticleTabs(null);
     }
 
@@ -671,74 +764,59 @@
     }
 
     // Normalizacja kategorii
-    let catString = '';
-    if (Array.isArray(currentArticle.categories)) {
-      catString = currentArticle.categories.map(c => getCatName(c)).join(', ');
-    } else if (typeof currentArticle.categories === 'string') {
-      try {
-        const parsed = JSON.parse(currentArticle.categories);
-        catString = Array.isArray(parsed) ? parsed.map(c => getCatName(c)).join(', ') : currentArticle.categories;
-      } catch {
-        catString = currentArticle.categories;
-      }
-    }
+    const catsArr = parseCategories(currentArticle.categories);
+    const catString = catsArr.join(', ');
 
-    // Ostrzeżenie o uprawnieniach
-    const isLockedAndNotAdmin = currentArticle.is_locked && (!state.currentUser || state.currentUser.role !== 'admin');
-    const isAnonDisallowed = String(state.settings.allow_anonymous_edits) === '0' && !state.currentUser;
+    // Ostrzeżenie o blokadzie artykułu
+    const isLockedAndNotAdmin = Boolean(currentArticle.is_locked && (!state.currentUser || state.currentUser.role !== 'admin'));
 
     viewRoot.innerHTML = `
       <div class="editor-container">
         <header class="editor-header">
           <h1>${isNew ? '➕ Tworzenie nowego artykułu' : `✏️ Edycja: ${escapeHtml(currentArticle.title)}`}</h1>
-          <p class="editor-lead">Formatuj treść w składni wikikodu (np. <code>== Nagłówek ==</code>, <code>'''pogrubienie'''</code>, <code>[[Link]]</code>, <code>&lt;ref&gt;źródło&lt;/ref&gt;</code>).</p>
+          <p class="editor-lead">Formatuj treść w składni wikikodu (np. <code>== Nagłówek ==</code>, <code>'''pogrubienie'''</code>, <code>[[Link]]</code>, <code>&lt;ref&gt;źródło&lt;/ref&gt;</code>). Skrót <strong>Ctrl+S</strong> zapisuje stronę.</p>
           ${isLockedAndNotAdmin ? `
-            <div class="alert alert-warning">
-              🔒 <strong>Artykuł zabezpieczony:</strong> Ten artykuł może edytować wyłącznie administrator.
-            </div>
-          ` : ''}
-          ${isAnonDisallowed ? `
-            <div class="alert alert-warning">
-              ⚠️ <strong>Wymagane logowanie:</strong> Edycje anonimowe zostały wyłączone przez administratora. Zaloguj się, aby zapisać zmiany.
+            <div class="alert alert-warning" role="alert">
+              🔒 <strong>Artykuł zabezpieczony:</strong> Ten artykuł może edytować wyłącznie administrator. Pola edycyjne zostały zablokowane.
             </div>
           ` : ''}
         </header>
 
         <form id="article-editor-form" class="editor-form">
           <div class="form-group">
-            <label for="edit-title">Tytuł hasła:</label>
-            <input type="text" id="edit-title" class="form-control" value="${escapeHtml(currentArticle.title)}" placeholder="Np. Komputer kwantowy" required />
+            <label for="edit-title">Tytuł hasła: <span class="required">*</span></label>
+            <input type="text" id="edit-title" class="form-control" value="${escapeHtml(currentArticle.title)}" placeholder="Np. Komputer kwantowy" required ${isLockedAndNotAdmin ? 'disabled' : ''} />
           </div>
 
           <div class="form-group">
             <label for="edit-summary">Krótkie podsumowanie (zajawka):</label>
-            <input type="text" id="edit-summary" class="form-control" value="${escapeHtml(currentArticle.summary || '')}" placeholder="Jednozdaniowe podsumowanie artykułu" />
+            <input type="text" id="edit-summary" class="form-control" value="${escapeHtml(currentArticle.summary || '')}" placeholder="Jednozdaniowe podsumowanie artykułu" ${isLockedAndNotAdmin ? 'disabled' : ''} />
           </div>
 
           <div class="form-group">
             <label for="edit-categories">Kategorie (oddzielone przecinkami):</label>
-            <input type="text" id="edit-categories" class="form-control" value="${escapeHtml(catString)}" placeholder="Np. Informatyka, Fizyka, Technologia" />
+            <input type="text" id="edit-categories" class="form-control" value="${escapeHtml(catString)}" placeholder="Np. Informatyka, Fizyka, Technologia" ${isLockedAndNotAdmin ? 'disabled' : ''} />
           </div>
 
           <!-- Pasek narzędzi formatowania -->
-          <div class="editor-toolbar">
-            <button type="button" class="toolbar-btn" data-action="heading" title="Wstaw nagłówek sekcji"><strong>H2</strong> Nagłówek</button>
-            <button type="button" class="toolbar-btn" data-action="subheading" title="Wstaw podnagłówek"><strong>H3</strong> Podnagłówek</button>
-            <button type="button" class="toolbar-btn" data-action="bold" title="Pogrubienie"><strong>B</strong> Pogrubienie</button>
-            <button type="button" class="toolbar-btn" data-action="italic" title="Kursywa"><em>I</em> Kursywa</button>
-            <button type="button" class="toolbar-btn" data-action="link" title="Wstaw link wewnętrzny">🔗 Link [[...]]</button>
-            <button type="button" class="toolbar-btn" data-action="ref" title="Wstaw przypis">📑 Przypis &lt;ref&gt;</button>
-            <button type="button" class="toolbar-btn" data-action="bullet" title="Lista punktowana">• Lista</button>
-            <button type="button" class="toolbar-btn" data-action="infobox-helper" title="Wstaw pole infoboxu">ℹ️ Pomocnik Infoboksu</button>
+          <div class="editor-toolbar" role="toolbar" aria-label="Narzędzia formatowania">
+            <button type="button" class="toolbar-btn btn-tool" data-action="heading" title="Wstaw nagłówek sekcji (==)"><strong>H2</strong> Nagłówek</button>
+            <button type="button" class="toolbar-btn btn-tool" data-action="subheading" title="Wstaw podnagłówek (===)"><strong>H3</strong> Podnagłówek</button>
+            <button type="button" class="toolbar-btn btn-tool" data-action="bold" title="Pogrubienie ('''tekst''')"><strong>B</strong> Pogrubienie</button>
+            <button type="button" class="toolbar-btn btn-tool" data-action="italic" title="Kursywa (''tekst'')"><em>I</em> Kursywa</button>
+            <button type="button" class="toolbar-btn btn-tool" data-action="link" title="Wstaw link wewnętrzny ([[...]])">🔗 Link [[...]]</button>
+            <button type="button" class="toolbar-btn btn-tool" data-action="ref" title="Wstaw przypis (&lt;ref&gt;...&lt;/ref&gt;)">📑 Przypis</button>
+            <button type="button" class="toolbar-btn btn-tool" data-action="bullet" title="Lista punktowana (*)">• Lista</button>
+            <button type="button" class="toolbar-btn btn-tool" data-action="infobox-helper" title="Dodaj wiersz infoboksu">ℹ️ Pomocnik Infoboksu</button>
           </div>
 
           <div class="form-group">
-            <label for="edit-content">Treść artykułu (wikikod):</label>
-            <textarea id="edit-content" class="editor-textarea form-control" rows="18" placeholder="Wpisz treść artykułu...">${escapeHtml(currentArticle.content || '')}</textarea>
+            <label for="edit-content">Treść artykułu (wikikod): <span class="required">*</span></label>
+            <textarea id="edit-content" class="editor-textarea form-control" rows="18" placeholder="Wpisz treść artykułu w wikikodzie..." ${isLockedAndNotAdmin ? 'disabled' : ''}>${escapeHtml(currentArticle.content || '')}</textarea>
           </div>
 
           <!-- Sekcja edytora infoboxu -->
-          <fieldset class="infobox-editor-fieldset">
+          <fieldset class="infobox-editor-fieldset" ${isLockedAndNotAdmin ? 'disabled' : ''}>
             <legend>ℹ️ Infobox (tabela boczna)</legend>
             <div class="form-group">
               <label for="infobox-title">Tytuł infoboksu:</label>
@@ -746,28 +824,31 @@
             </div>
             <div class="form-group">
               <label for="infobox-image">Adres URL obrazka (opcjonalny):</label>
-              <input type="text" id="infobox-image" class="form-control" value="${escapeHtml(infoboxObj.image || '')}" placeholder="https://..." />
+              <input type="url" id="infobox-image" class="form-control" value="${escapeHtml(infoboxObj.image || '')}" placeholder="https://..." />
             </div>
-            <div class="infobox-rows-label">Wiersze klucz - wartość:</div>
+            <div class="infobox-rows-label">Pola infoboksu (klucz &rarr; wartość):</div>
             <div id="infobox-rows-container" class="infobox-editor-grid"></div>
             <button type="button" id="infobox-add-row-btn" class="btn btn-sm btn-outline">+ Dodaj pole infoboxu</button>
           </fieldset>
 
           <div class="form-group">
-            <label for="edit-comment">Komentarz do edycji:</label>
-            <input type="text" id="edit-comment" class="form-control" placeholder="Opisz wprowadzone zmiany (np. 'Utworzenie hasła', 'Korekta literówki')" value="${isNew ? 'Utworzenie artykułu' : ''}" />
+            <label for="edit-comment">Opis zmian (komentarz do wersji):</label>
+            <input type="text" id="edit-comment" class="form-control" placeholder="Np. 'Utworzenie hasła', 'Korekta literówki', 'Rozszerzenie sekcji'" value="${isNew ? 'Utworzenie artykułu' : ''}" ${isLockedAndNotAdmin ? 'disabled' : ''} />
           </div>
 
           <div class="editor-actions">
             <button type="button" id="editor-preview-btn" class="btn btn-secondary">👁️ Podgląd na żywo</button>
-            <button type="submit" id="editor-save-btn" class="btn btn-primary">💾 ${isNew ? 'Utwórz artykuł' : 'Zapisz zmiany'}</button>
-            <a href="${isNew ? '#/' : `#/wiki/${slug}`}" class="btn btn-outline">Anuluj</a>
+            <button type="submit" id="editor-save-btn" class="btn btn-primary" ${isLockedAndNotAdmin ? 'disabled title="Artykuł zablokowany"' : ''}>💾 ${isNew ? 'Utwórz artykuł' : 'Zapisz zmiany'}</button>
+            <a href="${isNew ? '#/' : `#/wiki/${encodeURIComponent(slug)}`}" class="btn btn-outline">Anuluj</a>
           </div>
         </form>
 
         <!-- Pudełko podglądu -->
-        <div id="preview-wrapper" class="preview-wrapper hidden">
-          <h2>Podgląd artykułu</h2>
+        <div id="preview-wrapper" class="preview-wrapper hidden" aria-live="polite">
+          <div class="preview-box-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+            <h2>Podgląd artykułu</h2>
+            <button type="button" id="preview-close-btn" class="btn btn-sm btn-outline">Zamknij podgląd &times;</button>
+          </div>
           <div id="preview-box" class="preview-box wiki-article-body-wrapper"></div>
         </div>
       </div>
@@ -781,9 +862,9 @@
       const row = document.createElement('div');
       row.className = 'infobox-row-item';
       row.innerHTML = `
-        <input type="text" class="form-control info-key" placeholder="Etykieta (np. Stolica, Data ur.)" value="${escapeHtml(key)}" />
-        <input type="text" class="form-control info-val" placeholder="Wartość (np. Warszawa, 1473)" value="${escapeHtml(val)}" />
-        <button type="button" class="btn btn-danger btn-sm info-del" title="Usuń">&times;</button>
+        <input type="text" class="form-control info-key" placeholder="Etykieta (np. Stolica)" value="${escapeHtml(key)}" ${isLockedAndNotAdmin ? 'disabled' : ''} />
+        <input type="text" class="form-control info-val" placeholder="Wartość (np. Warszawa)" value="${escapeHtml(val)}" ${isLockedAndNotAdmin ? 'disabled' : ''} />
+        <button type="button" class="btn btn-danger btn-sm info-del" title="Usuń pole" ${isLockedAndNotAdmin ? 'disabled' : ''}>&times;</button>
       `;
       row.querySelector('.info-del').addEventListener('click', () => {
         row.remove();
@@ -827,15 +908,36 @@
         if (action === 'bullet') insertAroundSelection('\n* ');
         if (action === 'infobox-helper') {
           addInfoboxRow('Klucz', 'Wartość');
-          showToast('Dodano nowe pole do infoboksu poniżej', 'info');
+          showToast('Dodano pole do infoboksu poniżej', 'info');
         }
       });
+    });
+
+    // Skróty klawiszowe w edytorze (Ctrl+S, Ctrl+B, Ctrl+I)
+    const editorForm = document.getElementById('article-editor-form');
+    textarea.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        insertAroundSelection("'''", "'''");
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'i') {
+        e.preventDefault();
+        insertAroundSelection("''", "''");
+      }
+    });
+
+    editorForm.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        if (!isLockedAndNotAdmin) {
+          editorForm.requestSubmit();
+        }
+      }
     });
 
     // Zbieranie danych infoboxu z formularza
     function collectInfoboxData() {
       const title = document.getElementById('infobox-title').value.trim();
-      const image = document.getElementById('infobox-image').value.trim();
+      const image = sanitizeImageUrl(document.getElementById('infobox-image').value.trim());
       const collectedItems = {};
       infoboxContainer.querySelectorAll('.infobox-row-item').forEach(row => {
         const k = row.querySelector('.info-key').value.trim();
@@ -857,7 +959,7 @@
     // Podgląd na żywo
     document.getElementById('editor-preview-btn').addEventListener('click', async () => {
       const content = textarea.value;
-      const title = document.getElementById('edit-title').value;
+      const title = document.getElementById('edit-title').value.trim() || 'Podgląd';
       const previewWrapper = document.getElementById('preview-wrapper');
       const previewBox = document.getElementById('preview-box');
 
@@ -870,7 +972,7 @@
         previewBox.innerHTML = `
           ${renderInfobox(currentInfobox, title)}
           ${renderToc(res.toc)}
-          <div class="wiki-article-body">${res.renderedHtml}</div>
+          <div class="wiki-article-body">${res.renderedHtml || '<p><em>Pusta treść</em></p>'}</div>
         `;
         previewWrapper.classList.remove('hidden');
         previewWrapper.scrollIntoView({ behavior: 'smooth' });
@@ -879,14 +981,34 @@
       }
     });
 
+    document.getElementById('preview-close-btn')?.addEventListener('click', () => {
+      document.getElementById('preview-wrapper')?.classList.add('hidden');
+    });
+
     // Zapis formularza
-    document.getElementById('article-editor-form').addEventListener('submit', async (e) => {
+    editorForm.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (isLockedAndNotAdmin) {
+        showToast('Artykuł jest zabezpieczony. Brak uprawnień do zapisu.', 'error');
+        return;
+      }
+
       const title = document.getElementById('edit-title').value.trim();
       const summary = document.getElementById('edit-summary').value.trim();
       const content = textarea.value.trim();
       const rawCats = document.getElementById('edit-categories').value;
       const edit_comment = document.getElementById('edit-comment').value.trim();
+
+      if (!title) {
+        showToast('Podaj tytuł artykułu', 'warning');
+        document.getElementById('edit-title').focus();
+        return;
+      }
+      if (!content) {
+        showToast('Wpisz treść artykułu', 'warning');
+        textarea.focus();
+        return;
+      }
 
       const categories = rawCats
         .split(',')
@@ -894,30 +1016,30 @@
         .filter(c => c.length > 0);
 
       const infobox = collectInfoboxData();
-
-      if (!title) {
-        showToast('Podaj tytuł artykułu', 'warning');
-        return;
-      }
+      const saveBtn = document.getElementById('editor-save-btn');
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Zapisywanie...';
 
       try {
         if (isNew) {
           const res = await api('/api/articles', {
             method: 'POST',
-            body: { title, summary, content, infobox, categories, edit_comment }
+            body: { title, summary, content, infobox, categories, edit_comment: edit_comment || 'Utworzenie artykułu' }
           });
           showToast('Artykuł został pomyślnie utworzony!', 'success');
-          window.location.hash = `#/wiki/${res.article.slug}`;
+          window.location.hash = `#/wiki/${encodeURIComponent(res.article.slug)}`;
         } else {
           const res = await api(`/api/articles/${encodeURIComponent(slug)}`, {
             method: 'PUT',
-            body: { title, summary, content, infobox, categories, edit_comment }
+            body: { title, summary, content, infobox, categories, edit_comment: edit_comment || 'Edycja artykułu' }
           });
           showToast('Zmiany w artykule zostały zapisane!', 'success');
-          window.location.hash = `#/wiki/${res.article.slug}`;
+          window.location.hash = `#/wiki/${encodeURIComponent(res.article.slug)}`;
         }
       } catch (err) {
         showToast(err.message, 'error');
+        saveBtn.disabled = false;
+        saveBtn.textContent = isNew ? '💾 Utwórz artykuł' : '💾 Zapisz zmiany';
       }
     });
   }
@@ -925,6 +1047,7 @@
   // --- WIDOK 5: Dyskusja artykułu (#/wiki/:slug/talk) ---
   async function renderTalkView(slug) {
     const viewRoot = document.getElementById('view-root');
+    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie dyskusji...</div>';
 
     try {
@@ -932,13 +1055,14 @@
       const talkData = await api(`/api/articles/${encodeURIComponent(slug)}/talk`);
       const messages = talkData.messages || [];
 
+      setPageTitle(`Dyskusja: ${artData.article.title}`);
       updateArticleTabs(slug, 'talk', artData.revisionsCount, messages.length);
 
       viewRoot.innerHTML = `
         <div class="talk-thread">
           <header class="talk-header">
             <h1>Dyskusja: ${escapeHtml(artData.article.title)}</h1>
-            <p>To jest strona dyskusji przeznaczona do omawiania ulepszeń artykułu <a href="#/wiki/${slug}">${escapeHtml(artData.article.title)}</a>.</p>
+            <p>To jest strona dyskusji przeznaczona do omawiania ulepszeń artykułu <a href="#/wiki/${encodeURIComponent(slug)}">${escapeHtml(artData.article.title)}</a>.</p>
           </header>
 
           <div class="talk-messages-list">
@@ -948,11 +1072,11 @@
               </div>
             ` : messages.map(msg => `
               <div class="talk-message-card" id="talk-msg-${msg.id}">
-                <div class="talk-msg-header">
-                  <span class="talk-author">💬 <strong>${escapeHtml(msg.author || 'Anonim')}</strong></span>
-                  <span class="talk-date">${formatDate(msg.created_at)}</span>
+                <div class="talk-message-header talk-msg-header">
+                  <span class="talk-message-author talk-author">💬 <strong>${escapeHtml(msg.author || 'Anonim')}</strong></span>
+                  <span class="talk-message-date talk-date">${formatDate(msg.created_at)}</span>
                 </div>
-                <div class="talk-msg-content">${escapeHtml(msg.content)}</div>
+                <div class="talk-message-content talk-msg-content">${escapeHtml(msg.content)}</div>
               </div>
             `).join('')}
           </div>
@@ -966,21 +1090,30 @@
                 <input type="text" id="talk-author-input" class="form-control" value="${escapeHtml(state.currentUser ? state.currentUser.username : '')}" placeholder="Podpis (lub pozostaw puste dla Anonim)" ${state.currentUser ? 'readonly' : ''} />
               </div>
               <div class="form-group">
-                <label for="talk-content-input">Treść wiadomości:</label>
+                <label for="talk-content-input">Treść wiadomości: <span class="required">*</span></label>
                 <textarea id="talk-content-input" class="form-control" rows="4" placeholder="Wpisz treść swojej uwagi lub propozycji do artykułu..." required></textarea>
               </div>
-              <button type="submit" class="btn btn-primary">Wyślij wypowiedź</button>
+              <button type="submit" id="talk-submit-btn" class="btn btn-primary">Wyślij wypowiedź</button>
             </form>
           </div>
         </div>
       `;
 
-      document.getElementById('talk-add-form').addEventListener('submit', async (e) => {
+      const talkForm = document.getElementById('talk-add-form');
+      talkForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const author = document.getElementById('talk-author-input').value.trim() || (state.currentUser ? state.currentUser.username : 'Anonim');
         const content = document.getElementById('talk-content-input').value.trim();
 
-        if (!content) return;
+        if (!content) {
+          showToast('Wpisz treść wiadomości przed wysłaniem', 'warning');
+          document.getElementById('talk-content-input').focus();
+          return;
+        }
+
+        const submitBtn = document.getElementById('talk-submit-btn');
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Wysyłanie...';
 
         try {
           await api(`/api/articles/${encodeURIComponent(slug)}/talk`, {
@@ -991,17 +1124,26 @@
           renderTalkView(slug);
         } catch (err) {
           showToast(err.message, 'error');
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Wyślij wypowiedź';
         }
       });
 
     } catch (err) {
-      viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania dyskusji: ${escapeHtml(err.message)}</div>`;
+      updateArticleTabs(null);
+      viewRoot.innerHTML = `
+        <div class="wiki-error">
+          <p>Błąd wczytywania dyskusji: ${escapeHtml(err.message)}</p>
+          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
+        </div>
+      `;
     }
   }
 
   // --- WIDOK 6: Historia i Diff (#/wiki/:slug/history) ---
   async function renderHistoryView(slug) {
     const viewRoot = document.getElementById('view-root');
+    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie historii wersji...</div>';
 
     try {
@@ -1009,6 +1151,7 @@
       const revisions = data.revisions || [];
       const art = data.article || { title: slug, slug };
 
+      setPageTitle(`Historia zmian: ${art.title}`);
       updateArticleTabs(slug, 'history', revisions.length);
 
       viewRoot.innerHTML = `
@@ -1026,37 +1169,28 @@
             </div>
 
             <!-- Kontener na wynik porównania diff -->
-            <div id="diff-output-container" class="diff-container hidden"></div>
+            <div id="diff-output-container" class="diff-container hidden" aria-live="polite"></div>
 
             <div class="revision-list">
-              <table class="wiki-table history-table">
-                <thead>
-                  <tr>
-                    <th style="width: 40px;">Od</th>
-                    <th style="width: 40px;">Do</th>
-                    <th>Data i godzina</th>
-                    <th>Autor edycji</th>
-                    <th>Komentarz do edycji</th>
-                    ${canEditWiki() ? '<th>Akcje</th>' : ''}
-                  </tr>
-                </thead>
-                <tbody>
-                  ${revisions.map((rev, idx) => `
-                    <tr class="revision-row" data-id="${rev.id}">
-                      <td><input type="radio" name="diff-from" value="${rev.id}" ${idx === 1 ? 'checked' : ''} /></td>
-                      <td><input type="radio" name="diff-to" value="${rev.id}" ${idx === 0 ? 'checked' : ''} /></td>
-                      <td><strong>${formatDate(rev.created_at)}</strong></td>
-                      <td>${escapeHtml(rev.editor || 'Anonim')}</td>
-                      <td><em>${escapeHtml(rev.edit_comment || '(brak komentarza)')}</em></td>
-                      ${canEditWiki() ? `
-                        <td>
-                          <button type="button" class="btn btn-sm btn-outline revert-btn" data-id="${rev.id}">⏪ Przywróć</button>
-                        </td>
-                      ` : ''}
-                    </tr>
-                  `).join('')}
-                </tbody>
-              </table>
+              ${revisions.map((rev, idx) => `
+                <div class="revision-item ${idx === 0 ? 'current' : ''}" data-id="${rev.id}">
+                  <div class="revision-meta">
+                    <div class="revision-radios">
+                      <label title="Wersja bazowa (od)"><input type="radio" name="diff-from" value="${rev.id}" ${idx === 1 ? 'checked' : ''} aria-label="Porównaj od wersji #${rev.id}" /></label>
+                      <label title="Wersja porównywana (do)"><input type="radio" name="diff-to" value="${rev.id}" ${idx === 0 ? 'checked' : ''} aria-label="Porównaj do wersji #${rev.id}" /></label>
+                    </div>
+                    <span class="revision-date"><strong>${formatDate(rev.created_at)}</strong></span>
+                    <span class="revision-author">${escapeHtml(rev.editor || 'Anonim')}</span>
+                    <span class="revision-comment">${escapeHtml(rev.edit_comment ? `„${rev.edit_comment}”` : '(brak komentarza)')}</span>
+                    ${idx === 0 ? '<span class="status-pill draft" style="font-size:0.75rem;">Aktualna</span>' : ''}
+                  </div>
+                  <div class="revision-actions">
+                    ${(canEditWiki() && idx > 0) ? `
+                      <button type="button" class="btn btn-sm btn-outline revert-btn" data-id="${rev.id}" data-comment="${escapeHtml(rev.edit_comment || '')}">⏪ Przywróć</button>
+                    ` : ''}
+                  </div>
+                </div>
+              `).join('')}
             </div>
           `}
         </div>
@@ -1104,21 +1238,29 @@
             return;
           }
 
+          btn.disabled = true;
           try {
             await api(`/api/articles/${encodeURIComponent(slug)}/revert`, {
               method: 'POST',
               body: { revisionId: revId }
             });
-            showToast('Artykuł został przywrócony do wybranej wersji!', 'success');
-            window.location.hash = `#/wiki/${slug}`;
+            showToast('Artykuł został pomyślnie przywrócony!', 'success');
+            window.location.hash = `#/wiki/${encodeURIComponent(slug)}`;
           } catch (err) {
+            btn.disabled = false;
             showToast(err.message, 'error');
           }
         });
       });
 
     } catch (err) {
-      viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania historii: ${escapeHtml(err.message)}</div>`;
+      updateArticleTabs(null);
+      viewRoot.innerHTML = `
+        <div class="wiki-error">
+          <p>Błąd wczytywania historii: ${escapeHtml(err.message)}</p>
+          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
+        </div>
+      `;
     }
   }
 
@@ -1142,7 +1284,7 @@
 
       diffLinesHtml += `
         <tr class="${lineClass}">
-          <td class="diff-sign">${sign}</td>
+          <td class="diff-sign" aria-hidden="true">${sign}</td>
           <td class="diff-code"><pre>${escapeHtml(item.line || '')}</pre></td>
         </tr>
       `;
@@ -1150,12 +1292,16 @@
 
     container.innerHTML = `
       <div class="diff-box">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <h3>Porównanie wersji</h3>
+          <button type="button" id="diff-close-btn" class="btn btn-sm btn-outline">Zamknij diff &times;</button>
+        </div>
         <div class="diff-header-info">
           <div class="diff-ver-box">
-            <strong>Wersja bazowa (#${fromRev.id}):</strong> ${formatDate(fromRev.created_at)} przez <em>${escapeHtml(fromRev.editor || 'Anonim')}</em>
+            <strong>Wersja bazowa (#${fromRev.id || '?'}):</strong> ${formatDate(fromRev.created_at)} przez <em>${escapeHtml(fromRev.editor || 'Anonim')}</em>
           </div>
           <div class="diff-ver-box">
-            <strong>Wersja porównywana (#${toRev.id}):</strong> ${formatDate(toRev.created_at)} przez <em>${escapeHtml(toRev.editor || 'Anonim')}</em>
+            <strong>Wersja porównywana (#${toRev.id || '?'}):</strong> ${formatDate(toRev.created_at)} przez <em>${escapeHtml(toRev.editor || 'Anonim')}</em>
           </div>
         </div>
         <table class="diff-table">
@@ -1165,12 +1311,18 @@
         </table>
       </div>
     `;
+
+    document.getElementById('diff-close-btn')?.addEventListener('click', () => {
+      container.classList.add('hidden');
+    });
   }
 
   // --- WIDOK 7: Katalog Artykułów (#/articles) ---
   async function renderArticlesCatalog(query = '', selectedCategory = '') {
     updateArticleTabs(null);
+    setPageTitle('Indeks artykułów');
     const viewRoot = document.getElementById('view-root');
+    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie katalogu artykułów...</div>';
 
     try {
@@ -1187,7 +1339,7 @@
                 <h1>Indeks artykułów</h1>
                 <p>Spis haseł encyklopedycznych z filtrowaniem według nazwy i działu.</p>
               </div>
-              ${canEditWiki() ? '<a href="#/new" class="catalog-create-link">+ Utwórz nowe hasło</a>' : ''}
+              ${canEditWiki() ? '<a href="#/new" class="catalog-create-link btn btn-primary btn-sm">+ Utwórz nowe hasło</a>' : ''}
             </div>
           </header>
 
@@ -1207,7 +1359,8 @@
                 }).join('')}
               </select>
             </div>
-            <button id="catalog-filter-btn" type="button" class="btn">Filtruj</button>
+            <button id="catalog-filter-btn" type="button" class="btn btn-secondary">Filtruj</button>
+            ${(query || selectedCategory) ? '<button id="catalog-reset-btn" type="button" class="btn btn-outline">Wyczyść filtry</button>' : ''}
           </div>
 
           <div class="catalog-results-info">
@@ -1218,14 +1371,17 @@
             ${articles.length === 0 ? `
               <div class="catalog-empty">
                 <p>Nie znaleziono żadnych artykułów spełniających podane kryteria.</p>
+                ${(query && canEditWiki()) ? `
+                  <p><a href="#/new?title=${encodeURIComponent(query)}" class="btn btn-primary btn-sm">➕ Utwórz hasło: „${escapeHtml(query)}”</a></p>
+                ` : ''}
               </div>
             ` : articles.map(art => {
-              const cats = Array.isArray(art.categories) ? art.categories : (art.categories ? JSON.parse(art.categories) : []);
+              const cats = parseCategories(art.categories);
               return `
                 <article class="catalog-article-card">
                   <div class="catalog-card-main">
                     <div class="catalog-card-header">
-                      <h3><a href="#/wiki/${art.slug}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></h3>
+                      <h3><a href="#/wiki/${encodeURIComponent(art.slug)}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></h3>
                       <div class="catalog-card-badges">
                         ${art.is_featured ? '<span class="catalog-tag catalog-tag-featured">★ Wyróżniony</span>' : ''}
                         ${art.is_locked ? '<span class="catalog-tag">Zabezpieczony</span>' : ''}
@@ -1237,10 +1393,9 @@
                       ${cats && cats.length > 0 ? `
                         <div class="catalog-card-cats">
                           <span class="catalog-cats-label">Kategorie:</span>
-                          ${cats.map(c => {
-                            const cName = getCatName(c);
-                            return `<a href="#/categories/${encodeURIComponent(cName)}" class="badge-cat">${escapeHtml(cName)}</a>`;
-                          }).join('<span class="catalog-sep">·</span>')}
+                          ${cats.map(cName => `
+                            <a href="#/categories/${encodeURIComponent(cName)}" class="badge-cat">${escapeHtml(cName)}</a>
+                          `).join('<span class="catalog-sep">·</span>')}
                         </div>
                       ` : '<span></span>'}
                       <div class="catalog-card-meta">
@@ -1259,6 +1414,7 @@
 
       // Eventy filtracji
       const filterBtn = document.getElementById('catalog-filter-btn');
+      const resetBtn = document.getElementById('catalog-reset-btn');
       const searchInput = document.getElementById('catalog-search-input');
       const categorySelect = document.getElementById('catalog-category-select');
 
@@ -1277,9 +1433,19 @@
         if (e.key === 'Enter') triggerFilter();
       });
       categorySelect.addEventListener('change', triggerFilter);
+      if (resetBtn) {
+        resetBtn.addEventListener('click', () => {
+          window.location.hash = '#/articles';
+        });
+      }
 
     } catch (err) {
-      viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania katalogu: ${escapeHtml(err.message)}</div>`;
+      viewRoot.innerHTML = `
+        <div class="wiki-error">
+          <p>Błąd wczytywania katalogu: ${escapeHtml(err.message)}</p>
+          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
+        </div>
+      `;
     }
   }
 
@@ -1287,11 +1453,12 @@
   async function renderCategoriesView(selectedCategory = null) {
     updateArticleTabs(null);
     const viewRoot = document.getElementById('view-root');
+    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie kategorii...</div>';
 
     try {
       if (!selectedCategory) {
-        // Lista wszystkich kategorii
+        setPageTitle('Kategorie encyklopedii');
         const bootData = await api('/api/bootstrap');
         const cats = bootData.categories || [];
 
@@ -1303,7 +1470,7 @@
             </header>
 
             <div class="categories-large-grid">
-              ${cats.map(cat => {
+              ${cats.length === 0 ? '<p>Brak zdefiniowanych kategorii w encyklopedii.</p>' : cats.map(cat => {
                 const name = getCatName(cat);
                 const count = getCatCount(cat);
                 const countLabel = count === 1 ? '1 hasło' : `${count || 0} haseł`;
@@ -1318,7 +1485,7 @@
           </div>
         `;
       } else {
-        // Artykuły w danej kategorii
+        setPageTitle(`Kategoria: ${selectedCategory}`);
         const data = await api(`/api/articles?category=${encodeURIComponent(selectedCategory)}`);
         const articles = data.articles || [];
 
@@ -1335,41 +1502,58 @@
                 <div class="catalog-empty">
                   <p>Brak opublikowanych artykułów w kategorii <em>${escapeHtml(selectedCategory)}</em>.</p>
                 </div>
-              ` : articles.map(art => `
-                <article class="catalog-article-card">
-                  <div class="catalog-card-main">
-                    <div class="catalog-card-header">
-                      <h3><a href="#/wiki/${art.slug}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></h3>
-                      <div class="catalog-card-badges">
-                        ${art.is_featured ? '<span class="catalog-tag catalog-tag-featured">★ Wyróżniony</span>' : ''}
-                        ${art.is_locked ? '<span class="catalog-tag">Zabezpieczony</span>' : ''}
+              ` : articles.map(art => {
+                const cats = parseCategories(art.categories);
+                return `
+                  <article class="catalog-article-card">
+                    <div class="catalog-card-main">
+                      <div class="catalog-card-header">
+                        <h3><a href="#/wiki/${encodeURIComponent(art.slug)}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></h3>
+                        <div class="catalog-card-badges">
+                          ${art.is_featured ? '<span class="catalog-tag catalog-tag-featured">★ Wyróżniony</span>' : ''}
+                          ${art.is_locked ? '<span class="catalog-tag">Zabezpieczony</span>' : ''}
+                        </div>
+                      </div>
+                      <p class="catalog-card-summary">${escapeHtml(art.summary || 'Brak podsumowania.')}</p>
+                      <div class="catalog-card-footer">
+                        ${cats && cats.length > 0 ? `
+                          <div class="catalog-card-cats">
+                            <span class="catalog-cats-label">Kategorie:</span>
+                            ${cats.map(cName => `
+                              <a href="#/categories/${encodeURIComponent(cName)}" class="badge-cat">${escapeHtml(cName)}</a>
+                            `).join('<span class="catalog-sep">·</span>')}
+                          </div>
+                        ` : '<span></span>'}
+                        <div class="catalog-card-meta">
+                          <span>${art.views || 0} wyśw.</span>
+                          <span class="catalog-sep">·</span>
+                          <span>${formatDate(art.updated_at || art.created_at)}</span>
+                        </div>
                       </div>
                     </div>
-                    <p class="catalog-card-summary">${escapeHtml(art.summary || 'Brak podsumowania.')}</p>
-                    <div class="catalog-card-footer">
-                      <span></span>
-                      <div class="catalog-card-meta">
-                        <span>${art.views || 0} wyśw.</span>
-                        <span class="catalog-sep">·</span>
-                        <span>${formatDate(art.updated_at || art.created_at)}</span>
-                      </div>
-                    </div>
-                  </div>
-                </article>
-              `).join('')}
+                  </article>
+                `;
+              }).join('')}
             </div>
           </div>
         `;
       }
     } catch (err) {
-      viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania kategorii: ${escapeHtml(err.message)}</div>`;
+      viewRoot.innerHTML = `
+        <div class="wiki-error">
+          <p>Błąd wczytywania kategorii: ${escapeHtml(err.message)}</p>
+          <a href="#/categories" class="btn btn-secondary">&larr; Wszystkie kategorie</a>
+        </div>
+      `;
     }
   }
 
   // --- WIDOK 9: Ostatnie Zmiany (#/recent-changes) ---
   async function renderRecentChangesView() {
     updateArticleTabs(null);
+    setPageTitle('Ostatnie zmiany');
     const viewRoot = document.getElementById('view-root');
+    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie ostatnich zmian...</div>';
 
     try {
@@ -1393,12 +1577,12 @@
                 <div class="recent-change-row">
                   <div class="change-time">${formatDate(ch.created_at)}</div>
                   <div class="change-main">
-                    <span class="change-art-title"><a href="#/wiki/${slug}">${escapeHtml(title)}</a></span>
+                    <span class="change-art-title"><a href="#/wiki/${encodeURIComponent(slug)}">${escapeHtml(title)}</a></span>
                     <span class="change-author">przez <strong>${escapeHtml(ch.editor || 'Anonim')}</strong></span>
                     <div class="change-comment"><em>„${escapeHtml(ch.edit_comment || 'Aktualizacja treści')}”</em></div>
                   </div>
                   <div class="change-links">
-                    <a href="#/wiki/${slug}/history" class="btn btn-sm btn-outline">Historia</a>
+                    <a href="#/wiki/${encodeURIComponent(slug)}/history" class="btn btn-sm btn-outline">Historia</a>
                   </div>
                 </div>
               `;
@@ -1407,23 +1591,30 @@
         </div>
       `;
     } catch (err) {
-      viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania ostatnich zmian: ${escapeHtml(err.message)}</div>`;
+      viewRoot.innerHTML = `
+        <div class="wiki-error">
+          <p>Błąd wczytywania ostatnich zmian: ${escapeHtml(err.message)}</p>
+          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
+        </div>
+      `;
     }
   }
 
-  // --- WIDOK 10: Panel Administracyjny (ukryty adres: #/panel lub /panel) ---
+  // --- WIDOK 10: Panel Administracyjny (#/panel) ---
   async function renderAdminPanel() {
     updateArticleTabs(null);
+    setPageTitle('Panel administracyjny');
     const viewRoot = document.getElementById('view-root');
+    viewRoot.classList.add('view-fade-in');
 
     // Sprawdzenie czy użytkownik to admin
     if (!state.currentUser || state.currentUser.role !== 'admin') {
       viewRoot.innerHTML = `
         <div class="admin-auth-guard">
-          <h2>🔒 Wymagane logowanie</h2>
-          <p>Ta strona jest dostępna wyłącznie dla uprawnionych użytkowników.</p>
+          <h2>🔒 Wymagane logowanie administratora</h2>
+          <p>Ta strona jest dostępna wyłącznie dla uprawnionych administratorów witryny.</p>
           ${state.currentUser
-            ? '<p>Twoje konto nie ma wymaganych uprawnień.</p>'
+            ? '<p>Twoje konto nie posiada roli administratora.</p>'
             : '<button type="button" id="admin-page-login" class="btn btn-primary">Zaloguj się</button>'}
         </div>
       `;
@@ -1455,17 +1646,17 @@
           </header>
 
           <!-- Pasek zakładek panelu admina -->
-          <nav class="admin-tabs">
-            <button class="admin-tab-btn ${state.adminActiveTab === 'kpi' ? 'active' : ''}" data-tab="kpi">Podsumowanie</button>
-            <button class="admin-tab-btn ${state.adminActiveTab === 'articles' ? 'active' : ''}" data-tab="articles">Artykuły (${articles.length})</button>
-            <button class="admin-tab-btn ${state.adminActiveTab === 'users' ? 'active' : ''}" data-tab="users">Użytkownicy (${users.length})</button>
-            <button class="admin-tab-btn ${state.adminActiveTab === 'talk' ? 'active' : ''}" data-tab="talk">Dyskusje (${talkMessages.length})</button>
-            <button class="admin-tab-btn ${state.adminActiveTab === 'settings' ? 'active' : ''}" data-tab="settings">Ustawienia</button>
-            <button class="admin-tab-btn ${state.adminActiveTab === 'audit' ? 'active' : ''}" data-tab="audit">Dziennik zdarzeń</button>
+          <nav class="admin-tabs" role="tablist" aria-label="Kategorie panelu">
+            <button class="admin-tab-btn ${state.adminActiveTab === 'kpi' ? 'active' : ''}" data-tab="kpi" role="tab">Podsumowanie</button>
+            <button class="admin-tab-btn ${state.adminActiveTab === 'articles' ? 'active' : ''}" data-tab="articles" role="tab">Artykuły (${articles.length})</button>
+            <button class="admin-tab-btn ${state.adminActiveTab === 'users' ? 'active' : ''}" data-tab="users" role="tab">Użytkownicy (${users.length})</button>
+            <button class="admin-tab-btn ${state.adminActiveTab === 'talk' ? 'active' : ''}" data-tab="talk" role="tab">Dyskusje (${talkMessages.length})</button>
+            <button class="admin-tab-btn ${state.adminActiveTab === 'settings' ? 'active' : ''}" data-tab="settings" role="tab">Ustawienia</button>
+            <button class="admin-tab-btn ${state.adminActiveTab === 'audit' ? 'active' : ''}" data-tab="audit" role="tab">Dziennik zdarzeń</button>
           </nav>
 
           <!-- Zawartość zakładek -->
-          <div id="admin-tab-content" class="admin-tab-content"></div>
+          <div id="admin-tab-content" class="admin-tab-content" aria-live="polite"></div>
         </div>
       `;
 
@@ -1506,9 +1697,9 @@
               <p>Szybkie przejście do najczęstszych zadań redakcyjnych i konfiguracyjnych:</p>
               <div class="quick-admin-links">
                 <a href="#/new" class="btn btn-primary">+ Utwórz nowy artykuł</a>
-                <button type="button" class="btn switch-to-tab" data-target="articles">Zarządzaj artykułami i wyróżnieniami</button>
-                <button type="button" class="btn switch-to-tab" data-target="users">Zarządzaj kontami i rolami</button>
-                <button type="button" class="btn switch-to-tab" data-target="settings">Konfiguracja witryny</button>
+                <button type="button" class="btn btn-secondary switch-to-tab" data-target="articles">Zarządzaj artykułami i wyróżnieniami</button>
+                <button type="button" class="btn btn-secondary switch-to-tab" data-target="users">Zarządzaj kontami i rolami</button>
+                <button type="button" class="btn btn-secondary switch-to-tab" data-target="settings">Konfiguracja witryny</button>
               </div>
             </div>
           `;
@@ -1522,7 +1713,7 @@
         } else if (state.adminActiveTab === 'articles') {
           tabContent.innerHTML = `
             <div class="admin-section">
-              <div class="admin-section-header">
+              <div class="admin-section-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
                 <h2>Zarządzanie artykułami (${articles.length})</h2>
                 <a href="#/new" class="btn btn-primary btn-sm">➕ Utwórz artykuł</a>
               </div>
@@ -1540,7 +1731,7 @@
                   <tbody>
                     ${articles.map(art => `
                       <tr data-slug="${art.slug}">
-                        <td><strong><a href="#/wiki/${art.slug}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></strong></td>
+                        <td><strong><a href="#/wiki/${encodeURIComponent(art.slug)}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></strong></td>
                         <td>${art.views || 0}</td>
                         <td>
                           <div class="admin-status-group">
@@ -1551,21 +1742,21 @@
                         </td>
                         <td>
                           <div class="admin-btn-group">
-                            <button class="btn btn-sm btn-outline toggle-feature-btn" data-slug="${art.slug}" data-status="${art.is_featured ? 1 : 0}">
+                            <button type="button" class="btn btn-sm btn-outline toggle-feature-btn" data-slug="${art.slug}" data-status="${art.is_featured ? 1 : 0}">
                               ${art.is_featured ? '★ Zdejmij wyróżnienie' : '☆ Wyróżnij'}
                             </button>
-                            <button class="btn btn-sm btn-outline toggle-lock-btn" data-slug="${art.slug}" data-status="${art.is_locked ? 1 : 0}">
+                            <button type="button" class="btn btn-sm btn-outline toggle-lock-btn" data-slug="${art.slug}" data-status="${art.is_locked ? 1 : 0}">
                               ${art.is_locked ? 'Odbezpiecz' : 'Zabezpiecz'}
                             </button>
-                            <button class="btn btn-sm btn-outline toggle-publish-btn" data-slug="${art.slug}" data-status="${art.is_published ? 1 : 0}">
+                            <button type="button" class="btn btn-sm btn-outline toggle-publish-btn" data-slug="${art.slug}" data-status="${art.is_published ? 1 : 0}">
                               ${art.is_published ? 'Ukryj' : 'Opublikuj'}
                             </button>
                           </div>
                         </td>
                         <td>
                           <div class="admin-btn-group">
-                            <a href="#/wiki/${art.slug}/edit" class="btn btn-sm">Edytuj</a>
-                            <button class="btn btn-sm btn-danger delete-article-btn" data-slug="${art.slug}" data-title="${escapeHtml(art.title)}">Usuń</button>
+                            <a href="#/wiki/${encodeURIComponent(art.slug)}/edit" class="btn btn-sm btn-secondary">Edytuj</a>
+                            <button type="button" class="btn btn-sm btn-danger delete-article-btn" data-slug="${art.slug}" data-title="${escapeHtml(art.title)}">Usuń</button>
                           </div>
                         </td>
                       </tr>
@@ -1581,6 +1772,7 @@
             btn.addEventListener('click', async () => {
               const slug = btn.dataset.slug;
               const isLocked = btn.dataset.status === '1';
+              btn.disabled = true;
               try {
                 await api(`/api/admin/articles/${encodeURIComponent(slug)}/status`, {
                   method: 'PATCH',
@@ -1589,6 +1781,7 @@
                 showToast(`Zmieniono status blokady dla: ${slug}`, 'success');
                 renderAdminPanel();
               } catch (err) {
+                btn.disabled = false;
                 showToast(err.message, 'error');
               }
             });
@@ -1598,6 +1791,7 @@
             btn.addEventListener('click', async () => {
               const slug = btn.dataset.slug;
               const isFeatured = btn.dataset.status === '1';
+              btn.disabled = true;
               try {
                 await api(`/api/admin/articles/${encodeURIComponent(slug)}/status`, {
                   method: 'PATCH',
@@ -1606,6 +1800,7 @@
                 showToast(`Zaktualizowano wyróżnienie artykułu: ${slug}`, 'success');
                 renderAdminPanel();
               } catch (err) {
+                btn.disabled = false;
                 showToast(err.message, 'error');
               }
             });
@@ -1615,6 +1810,7 @@
             btn.addEventListener('click', async () => {
               const slug = btn.dataset.slug;
               const isPublished = btn.dataset.status === '1';
+              btn.disabled = true;
               try {
                 await api(`/api/admin/articles/${encodeURIComponent(slug)}/status`, {
                   method: 'PATCH',
@@ -1623,6 +1819,7 @@
                 showToast(`Zmieniono widoczność artykułu: ${slug}`, 'success');
                 renderAdminPanel();
               } catch (err) {
+                btn.disabled = false;
                 showToast(err.message, 'error');
               }
             });
@@ -1635,6 +1832,7 @@
               if (!confirm(`Czy na pewno chcesz BEZPOWROTNIE usunąć artykuł „${title}”?`)) {
                 return;
               }
+              btn.disabled = true;
               try {
                 await api(`/api/admin/articles/${encodeURIComponent(slug)}`, {
                   method: 'DELETE'
@@ -1642,6 +1840,7 @@
                 showToast(`Artykuł „${title}” został usunięty`, 'success');
                 renderAdminPanel();
               } catch (err) {
+                btn.disabled = false;
                 showToast(err.message, 'error');
               }
             });
@@ -1683,16 +1882,16 @@
               </div>
 
               <!-- Formularz dodawania nowego użytkownika -->
-              <div class="admin-subcard add-user-card">
+              <div class="admin-subcard add-user-card" style="margin-top:24px;">
                 <h3>➕ Utwórz nowe konto użytkownika</h3>
                 <form id="admin-add-user-form" class="admin-form-grid">
                   <div class="form-group">
-                    <label for="new-user-username">Nazwa użytkownika:</label>
-                    <input type="text" id="new-user-username" class="form-control" placeholder="Login" required />
+                    <label for="new-user-username">Nazwa użytkownika: <span class="required">*</span></label>
+                    <input type="text" id="new-user-username" class="form-control" placeholder="Login (min. 2 znaki)" required autocomplete="off" />
                   </div>
                   <div class="form-group">
-                    <label for="new-user-password">Hasło:</label>
-                    <input type="password" id="new-user-password" class="form-control" placeholder="Hasło" required />
+                    <label for="new-user-password">Hasło: <span class="required">*</span></label>
+                    <input type="password" id="new-user-password" class="form-control" placeholder="Hasło (min. 3 znaki)" required autocomplete="new-password" />
                   </div>
                   <div class="form-group">
                     <label for="new-user-role">Rola:</label>
@@ -1707,7 +1906,7 @@
                     <input type="text" id="new-user-bio" class="form-control" placeholder="Krótki opis konta" />
                   </div>
                   <div class="form-actions" style="grid-column: 1 / -1;">
-                    <button type="submit" class="btn btn-primary">Utwórz użytkownika</button>
+                    <button type="submit" id="admin-add-user-submit" class="btn btn-primary">Utwórz użytkownika</button>
                   </div>
                 </form>
               </div>
@@ -1719,13 +1918,16 @@
             sel.addEventListener('change', async () => {
               const userId = sel.dataset.id;
               const newRole = sel.value;
+              sel.disabled = true;
               try {
                 await api(`/api/admin/users/${userId}`, {
                   method: 'PATCH',
                   body: { role: newRole }
                 });
                 showToast(`Zaktualizowano rolę użytkownika #${userId} na: ${newRole}`, 'success');
+                renderAdminPanel();
               } catch (err) {
+                sel.disabled = false;
                 showToast(err.message, 'error');
                 renderAdminPanel();
               }
@@ -1733,12 +1935,26 @@
           });
 
           // Dodawanie użytkownika
-          document.getElementById('admin-add-user-form').addEventListener('submit', async (e) => {
+          const addUserForm = document.getElementById('admin-add-user-form');
+          addUserForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const username = document.getElementById('new-user-username').value.trim();
             const password = document.getElementById('new-user-password').value;
             const role = document.getElementById('new-user-role').value;
             const bio = document.getElementById('new-user-bio').value.trim();
+
+            if (!username || username.length < 2) {
+              showToast('Nazwa użytkownika musi mieć co najmniej 2 znaki', 'warning');
+              return;
+            }
+            if (!password || password.length < 3) {
+              showToast('Hasło musi mieć co najmniej 3 znaki', 'warning');
+              return;
+            }
+
+            const submitBtn = document.getElementById('admin-add-user-submit');
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Tworzenie...';
 
             try {
               await api('/api/admin/users', {
@@ -1748,6 +1964,8 @@
               showToast(`Użytkownik „${username}” został pomyślnie utworzony!`, 'success');
               renderAdminPanel();
             } catch (err) {
+              submitBtn.disabled = false;
+              submitBtn.textContent = 'Utwórz użytkownika';
               showToast(err.message, 'error');
             }
           });
@@ -1763,13 +1981,13 @@
                 ` : talkMessages.map(msg => `
                   <div class="talk-mod-card" data-id="${msg.id}">
                     <div class="talk-mod-header">
-                      <span>Artykuł: <strong><a href="#/wiki/${msg.article_slug}/talk">${escapeHtml(msg.article_title || msg.article_slug)}</a></strong></span>
+                      <span>Artykuł: <strong><a href="#/wiki/${encodeURIComponent(msg.article_slug)}/talk">${escapeHtml(msg.article_title || msg.article_slug)}</a></strong></span>
                       <span>Autor: <strong>${escapeHtml(msg.author || 'Anonim')}</strong></span>
                       <span>Data: ${formatDate(msg.created_at)}</span>
                     </div>
                     <div class="talk-mod-body">${escapeHtml(msg.content)}</div>
                     <div class="talk-mod-actions">
-                      <button class="btn btn-sm btn-danger delete-talk-btn" data-id="${msg.id}">🗑️ Usuń ten wpis</button>
+                      <button type="button" class="btn btn-sm btn-danger delete-talk-btn" data-id="${msg.id}">🗑️ Usuń ten wpis</button>
                     </div>
                   </div>
                 `).join('')}
@@ -1781,13 +1999,15 @@
             btn.addEventListener('click', async () => {
               const id = btn.dataset.id;
               if (!confirm('Czy na pewno chcesz usunąć ten wpis z dyskusji?')) return;
+              btn.disabled = true;
               try {
                 await api(`/api/admin/talk/${id}`, {
                   method: 'DELETE'
                 });
-                showToast('Wpis został usunięty', 'success');
+                showToast('Wpis został pomyślnie usunięty', 'success');
                 renderAdminPanel();
               } catch (err) {
+                btn.disabled = false;
                 showToast(err.message, 'error');
               }
             });
@@ -1799,7 +2019,7 @@
               <h2>⚙️ Ustawienia Encyklopedii</h2>
               <form id="admin-settings-form" class="admin-settings-form">
                 <div class="form-group">
-                  <label for="set-site-name">Nazwa witryny:</label>
+                  <label for="set-site-name">Nazwa witryny: <span class="required">*</span></label>
                   <input type="text" id="set-site-name" class="form-control" value="${escapeHtml(settings.site_name || 'WikiKurekk')}" required />
                 </div>
                 <div class="form-group">
@@ -1809,25 +2029,35 @@
                 <div class="form-group">
                   <label for="set-announcement">Baner ogłoszeniowy na samej górze strony:</label>
                   <input type="text" id="set-announcement" class="form-control" value="${escapeHtml(settings.announcement_banner || '')}" placeholder="Pozostaw puste, aby ukryć baner" />
-                  <small class="form-hint">Tekst widoczny dla wszystkich czytelników na szczycie strony.</small>
+                  <small class="form-hint" style="color:var(--wiki-text-muted); font-size:0.82rem;">Tekst widoczny dla wszystkich czytelników na szczycie strony.</small>
                 </div>
-                <div class="form-group checkbox-group">
-                  <label>
+                <div class="form-group checkbox-group" style="margin:14px 0;">
+                  <label style="cursor:pointer; display:flex; align-items:center; gap:8px;">
                     <input type="checkbox" id="set-anon-edits" ${String(settings.allow_anonymous_edits) === '1' ? 'checked' : ''} />
-                    Zezwalaj na anonimowe edycje (bez logowania)
+                    <span>Zezwalaj na anonimowe edycje (bez logowania)</span>
                   </label>
                 </div>
-                <button type="submit" class="btn btn-primary">Zapisz ustawienia</button>
+                <button type="submit" id="admin-settings-submit" class="btn btn-primary">Zapisz ustawienia</button>
               </form>
             </div>
           `;
 
-          document.getElementById('admin-settings-form').addEventListener('submit', async (e) => {
+          const settingsForm = document.getElementById('admin-settings-form');
+          settingsForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const site_name = document.getElementById('set-site-name').value.trim();
             const site_tagline = document.getElementById('set-site-tagline').value.trim();
             const announcement_banner = document.getElementById('set-announcement').value.trim();
             const allow_anonymous_edits = document.getElementById('set-anon-edits').checked ? '1' : '0';
+
+            if (!site_name) {
+              showToast('Nazwa witryny nie może być pusta', 'warning');
+              return;
+            }
+
+            const submitBtn = document.getElementById('admin-settings-submit');
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Zapisywanie...';
 
             try {
               const res = await api('/api/admin/settings', {
@@ -1836,8 +2066,12 @@
               });
               state.settings = res.settings;
               updateHeaderAndSidebar();
+              submitBtn.disabled = false;
+              submitBtn.textContent = 'Zapisz ustawienia';
               showToast('Ustawienia encyklopedii zostały zaktualizowane!', 'success');
             } catch (err) {
+              submitBtn.disabled = false;
+              submitBtn.textContent = 'Zapisz ustawienia';
               showToast(err.message, 'error');
             }
           });
@@ -1847,29 +2081,21 @@
             <div class="admin-section">
               <h2>Dziennik zdarzeń (Audit Log)</h2>
               <p class="admin-section-lead">Rejestr najważniejszych operacji administracyjnych i redakcyjnych.</p>
-              <div class="table-responsive">
-                <table class="wiki-table admin-table">
-                  <thead>
-                    <tr>
-                      <th>Data i czas</th>
-                      <th>Użytkownik</th>
-                      <th>Zdarzenie</th>
-                      <th>Szczegóły</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${auditLogs.length === 0 ? `
-                      <tr><td colspan="4">Brak wpisów w dzienniku zdarzeń.</td></tr>
-                    ` : auditLogs.map(log => `
-                      <tr class="audit-row">
-                        <td class="audit-date">${formatDate(log.created_at)}</td>
-                        <td class="audit-actor"><strong>${escapeHtml(log.actor || 'System')}</strong></td>
-                        <td class="audit-action"><code>${escapeHtml(log.action)}</code></td>
-                        <td class="audit-details">${escapeHtml(log.details || '')}</td>
-                      </tr>
-                    `).join('')}
-                  </tbody>
-                </table>
+              <div class="audit-log-list">
+                ${auditLogs.length === 0 ? `
+                  <p>Brak wpisów w dzienniku zdarzeń.</p>
+                ` : auditLogs.map(log => `
+                  <div class="audit-log-item">
+                    <div>
+                      <span class="audit-log-time">${formatDate(log.created_at)}</span>
+                      &nbsp;&middot;&nbsp;
+                      <span class="audit-actor"><strong>${escapeHtml(log.actor || 'System')}</strong></span>
+                      &nbsp;&middot;&nbsp;
+                      <code class="audit-log-action">${escapeHtml(log.action)}</code>
+                    </div>
+                    <div class="audit-details"><em>${escapeHtml(log.details || '')}</em></div>
+                  </div>
+                `).join('')}
               </div>
             </div>
           `;
@@ -1887,7 +2113,12 @@
       renderCurrentAdminSubTab();
 
     } catch (err) {
-      viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania panelu admina: ${escapeHtml(err.message)}</div>`;
+      viewRoot.innerHTML = `
+        <div class="wiki-error">
+          <p>Błąd wczytywania panelu administratora: ${escapeHtml(err.message)}</p>
+          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
+        </div>
+      `;
     }
   }
 
@@ -1955,6 +2186,17 @@
     // Zamknięcie podpowiedzi wyszukiwania przy zmianie trasy
     const suggestions = document.getElementById('search-suggestions');
     if (suggestions) suggestions.classList.add('hidden');
+    const searchInput = document.getElementById('search-input');
+    if (searchInput) searchInput.setAttribute('aria-expanded', 'false');
+
+    // Płynne przewinięcie na górę strony
+    window.scrollTo({ top: 0, behavior: 'instant' });
+
+    // Focus na głównym widoku dla czytników ekranowych
+    const viewRoot = document.getElementById('view-root');
+    if (viewRoot) {
+      viewRoot.focus({ preventScroll: true });
+    }
 
     switch (route.name) {
       case 'home':
@@ -2004,13 +2246,26 @@
   function openAuthModal(mode = 'login') {
     const authModal = document.getElementById('auth-modal');
     if (!authModal) return;
+
+    lastFocusedElementBeforeModal = document.activeElement;
     const isRegister = mode === 'register';
     document.getElementById('login-form')?.classList.toggle('hidden', isRegister);
     document.getElementById('register-form')?.classList.toggle('hidden', !isRegister);
     const title = document.getElementById('auth-modal-title');
     if (title) title.textContent = isRegister ? 'Zarejestruj się' : 'Zaloguj się';
     authModal.classList.remove('hidden');
-    document.getElementById(isRegister ? 'reg-username' : 'login-username')?.focus();
+
+    setTimeout(() => {
+      document.getElementById(isRegister ? 'reg-username' : 'login-username')?.focus();
+    }, 50);
+  }
+
+  function closeAuthModal() {
+    const authModal = document.getElementById('auth-modal');
+    if (authModal) authModal.classList.add('hidden');
+    if (lastFocusedElementBeforeModal && typeof lastFocusedElementBeforeModal.focus === 'function') {
+      lastFocusedElementBeforeModal.focus();
+    }
   }
 
   // --- Inicjalizacja formularza logowania / rejestracji i modala ---
@@ -2021,47 +2276,65 @@
     const authModalClose = document.getElementById('auth-modal-close');
     const logoutBtn = document.getElementById('logout-btn');
 
-    const closeModal = () => {
-      if (authModal) authModal.classList.add('hidden');
-    };
-
     if (authModalBtn) authModalBtn.addEventListener('click', () => openAuthModal('login'));
     if (registerModalBtn) registerModalBtn.addEventListener('click', () => openAuthModal('register'));
     document.querySelectorAll('[data-auth-mode]').forEach(btn => {
       btn.addEventListener('click', () => openAuthModal(btn.dataset.authMode));
     });
-    if (authModalClose) authModalClose.addEventListener('click', closeModal);
+    if (authModalClose) authModalClose.addEventListener('click', closeAuthModal);
     if (authModal) {
       authModal.addEventListener('click', (e) => {
-        if (e.target === authModal) closeModal();
+        if (e.target === authModal) closeAuthModal();
       });
     }
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') closeModal();
+      if (e.key === 'Escape' && authModal && !authModal.classList.contains('hidden')) {
+        closeAuthModal();
+      }
     });
 
     // Wylogowanie
     if (logoutBtn) {
       logoutBtn.addEventListener('click', async () => {
+        logoutBtn.disabled = true;
         try {
           await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
         } finally {
           clearAuthToken();
+          logoutBtn.disabled = false;
           showToast('Wylogowano pomyślnie.', 'info');
           handleRoute();
         }
       });
     }
 
-    // Formularz logowania tradycyjnego
+    // Formularz logowania
     const loginForm = document.getElementById('login-form');
     if (loginForm) {
       loginForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const usernameInput = document.getElementById('login-username');
         const passwordInput = document.getElementById('login-password');
+        const submitBtn = document.getElementById('login-submit');
+
         const username = usernameInput ? usernameInput.value.trim() : '';
         const password = passwordInput ? passwordInput.value : '';
+
+        if (!username) {
+          showToast('Wpisz nazwę użytkownika', 'warning');
+          usernameInput?.focus();
+          return;
+        }
+        if (!password) {
+          showToast('Wpisz hasło', 'warning');
+          passwordInput?.focus();
+          return;
+        }
+
+        if (submitBtn) {
+          submitBtn.disabled = true;
+          submitBtn.textContent = 'Logowanie...';
+        }
 
         try {
           const res = await api('/api/auth/login', {
@@ -2069,11 +2342,17 @@
             body: { username, password }
           });
           setAuthToken(res.token, res.user);
-          closeModal();
+          closeAuthModal();
           showToast(`Witaj z powrotem, ${res.user.username}!`, 'success');
+          if (passwordInput) passwordInput.value = '';
           handleRoute();
         } catch (err) {
           showToast(err.message, 'error');
+        } finally {
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Zaloguj się';
+          }
         }
       });
     }
@@ -2086,10 +2365,27 @@
         const usernameInput = document.getElementById('reg-username');
         const passwordInput = document.getElementById('reg-password');
         const bioInput = document.getElementById('reg-bio');
+        const submitBtn = document.getElementById('reg-submit');
 
         const username = usernameInput ? usernameInput.value.trim() : '';
         const password = passwordInput ? passwordInput.value : '';
         const bio = bioInput ? bioInput.value.trim() : '';
+
+        if (!username || username.length < 2) {
+          showToast('Nazwa użytkownika musi zawierać co najmniej 2 znaki', 'warning');
+          usernameInput?.focus();
+          return;
+        }
+        if (!password || password.length < 3) {
+          showToast('Hasło musi zawierać co najmniej 3 znaki', 'warning');
+          passwordInput?.focus();
+          return;
+        }
+
+        if (submitBtn) {
+          submitBtn.disabled = true;
+          submitBtn.textContent = 'Rejestrowanie...';
+        }
 
         try {
           const res = await api('/api/auth/register', {
@@ -2097,11 +2393,17 @@
             body: { username, password, bio }
           });
           setAuthToken(res.token, res.user);
-          closeModal();
+          closeAuthModal();
           showToast(`Konto ${res.user.username} zostało zarejestrowane!`, 'success');
+          if (passwordInput) passwordInput.value = '';
           handleRoute();
         } catch (err) {
           showToast(err.message, 'error');
+        } finally {
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Utwórz konto';
+          }
         }
       });
     }
@@ -2114,12 +2416,21 @@
     const suggestionsEl = document.getElementById('search-suggestions');
     const randomBtn = document.getElementById('random-article-btn');
 
+    let activeSuggestionIndex = -1;
+    let searchDebounceTimer = null;
+    let searchRequestId = 0;
+
     // Losowy artykuł
     const goToRandomArticle = async () => {
       try {
         const res = await api('/api/articles/random');
         if (res.slug) {
-          window.location.hash = `#/wiki/${res.slug}`;
+          const targetHash = `#/wiki/${encodeURIComponent(res.slug)}`;
+          if (window.location.hash === targetHash) {
+            handleRoute();
+          } else {
+            window.location.hash = targetHash;
+          }
         }
       } catch (err) {
         showToast(err.message, 'error');
@@ -2128,43 +2439,79 @@
 
     if (randomBtn) randomBtn.addEventListener('click', goToRandomArticle);
 
+    // Aktualizacja podświetlenia klawiaturą
+    function updateActiveSuggestion() {
+      const items = suggestionsEl.querySelectorAll('.search-suggestion-item');
+      items.forEach((item, idx) => {
+        if (idx === activeSuggestionIndex) {
+          item.classList.add('active');
+          item.setAttribute('aria-selected', 'true');
+          item.scrollIntoView({ block: 'nearest' });
+        } else {
+          item.classList.remove('active');
+          item.setAttribute('aria-selected', 'false');
+        }
+      });
+    }
+
     // Formularz szukania
     if (searchForm) {
       searchForm.addEventListener('submit', (e) => {
         e.preventDefault();
+        const items = suggestionsEl.querySelectorAll('.search-suggestion-item');
+        if (activeSuggestionIndex >= 0 && items[activeSuggestionIndex]) {
+          const chosen = items[activeSuggestionIndex];
+          const href = chosen.getAttribute('href');
+          if (href) {
+            suggestionsEl.classList.add('hidden');
+            searchInput.setAttribute('aria-expanded', 'false');
+            window.location.hash = href;
+            return;
+          }
+        }
+
         const q = searchInput ? searchInput.value.trim() : '';
         if (q) {
+          suggestionsEl.classList.add('hidden');
+          searchInput.setAttribute('aria-expanded', 'false');
           window.location.hash = `#/articles?q=${encodeURIComponent(q)}`;
-          if (suggestionsEl) suggestionsEl.classList.add('hidden');
+        } else {
+          showToast('Wpisz frazę do wyszukania', 'warning');
+          searchInput?.focus();
         }
       });
     }
 
     // Dynamiczne podpowiedzi w wyszukiwarce (debounced)
-    let searchDebounceTimer = null;
     if (searchInput && suggestionsEl) {
       searchInput.addEventListener('input', () => {
         if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
         const query = searchInput.value.trim();
+        activeSuggestionIndex = -1;
 
         if (query.length === 0) {
           suggestionsEl.innerHTML = '';
           suggestionsEl.classList.add('hidden');
+          searchInput.setAttribute('aria-expanded', 'false');
           return;
         }
+
+        const currentReq = ++searchRequestId;
 
         searchDebounceTimer = setTimeout(async () => {
           try {
             const data = await api(`/api/articles?q=${encodeURIComponent(query)}`);
+            if (currentReq !== searchRequestId) return;
+
             const results = (data.articles || []).slice(0, 5);
 
             if (results.length === 0) {
               suggestionsEl.innerHTML = `
-                <div class="search-suggestion-item search-suggestion-empty">
+                <div class="search-suggestion-item search-suggestion-empty" role="option">
                   Brak wyników dla „${escapeHtml(query)}”
                 </div>
                 ${canEditWiki() ? `
-                  <a href="#/new?title=${encodeURIComponent(query)}" class="search-suggestion-item search-suggestion-create">
+                  <a href="#/new?title=${encodeURIComponent(query)}" class="search-suggestion-item search-suggestion-create" role="option">
                     ➕ Utwórz brakujący artykuł: <strong>${escapeHtml(query)}</strong>
                   </a>
                 ` : ''}
@@ -2172,45 +2519,93 @@
             } else {
               suggestionsEl.innerHTML = `
                 ${results.map(art => `
-                  <a href="#/wiki/${art.slug}" class="search-suggestion-item">
+                  <a href="#/wiki/${encodeURIComponent(art.slug)}" class="search-suggestion-item" role="option">
                     <div class="search-suggestion-title">${escapeHtml(art.title)}</div>
                     ${art.summary ? `<div class="search-suggestion-snippet">${escapeHtml(art.summary)}</div>` : ''}
                   </a>
                 `).join('')}
                 ${canEditWiki() ? `
-                  <a href="#/new?title=${encodeURIComponent(query)}" class="search-suggestion-item search-suggestion-create">
+                  <a href="#/new?title=${encodeURIComponent(query)}" class="search-suggestion-item search-suggestion-create" role="option">
                     ➕ Utwórz brakujący artykuł: <strong>${escapeHtml(query)}</strong>
                   </a>
                 ` : ''}
               `;
             }
+
             suggestionsEl.classList.remove('hidden');
+            searchInput.setAttribute('aria-expanded', 'true');
+            activeSuggestionIndex = -1;
           } catch {
-            suggestionsEl.classList.add('hidden');
+            if (currentReq === searchRequestId) {
+              suggestionsEl.classList.add('hidden');
+              searchInput.setAttribute('aria-expanded', 'false');
+            }
           }
-        }, 220);
+        }, 200);
+      });
+
+      // Obsługa nawigacji klawiaturą w podpowiedziach
+      searchInput.addEventListener('keydown', (e) => {
+        const isVisible = !suggestionsEl.classList.contains('hidden');
+        if (!isVisible) return;
+
+        const items = suggestionsEl.querySelectorAll('.search-suggestion-item');
+        if (items.length === 0) return;
+
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          activeSuggestionIndex = (activeSuggestionIndex + 1) % items.length;
+          updateActiveSuggestion();
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          activeSuggestionIndex = (activeSuggestionIndex - 1 + items.length) % items.length;
+          updateActiveSuggestion();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          suggestionsEl.classList.add('hidden');
+          searchInput.setAttribute('aria-expanded', 'false');
+          activeSuggestionIndex = -1;
+        }
+      });
+
+      // Kliknięcie w element podpowiedzi zamyka menu
+      suggestionsEl.addEventListener('click', (e) => {
+        const item = e.target.closest('.search-suggestion-item');
+        if (item) {
+          suggestionsEl.classList.add('hidden');
+          searchInput.setAttribute('aria-expanded', 'false');
+          activeSuggestionIndex = -1;
+        }
       });
 
       // Kliknięcie poza wyszukiwarką zamyka podpowiedzi
       document.addEventListener('click', (e) => {
         if (!searchForm.contains(e.target)) {
           suggestionsEl.classList.add('hidden');
-        }
-      });
-
-      // Klawisz Escape zamyka podpowiedzi
-      searchInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') {
-          suggestionsEl.classList.add('hidden');
+          searchInput.setAttribute('aria-expanded', 'false');
+          activeSuggestionIndex = -1;
         }
       });
     }
   }
 
-  // --- Przechwytywanie kliknięć czerwonych linków, kotwic i zakładek ---
+  // --- Przechwytywanie kliknięć czerwonych linków, kotwic, spisu treści i zakładek ---
   function initGlobalClickHandlers() {
     document.addEventListener('click', (e) => {
-      // Płynne przewijanie do kotwic wewnątrz artykułu (TOC, przypisy)
+      // Rozwijanie / zwijanie spisu treści TOC
+      const tocToggleBtn = e.target.closest('#toc-toggle-btn');
+      if (tocToggleBtn) {
+        e.preventDefault();
+        const tocNav = tocToggleBtn.closest('.wiki-toc');
+        if (tocNav) {
+          const isCollapsed = tocNav.classList.toggle('collapsed');
+          tocToggleBtn.textContent = isCollapsed ? '[pokaż]' : '[ukryj]';
+          tocToggleBtn.setAttribute('aria-expanded', String(!isCollapsed));
+        }
+        return;
+      }
+
+      // Płynne przewijanie do kotwic wewnątrz artykułu (TOC, przypisy, sekcje)
       const anchorLink = e.target.closest('a[href^="#sekcja-"], a[href^="#ref-"], a[href^="#cite_"]');
       if (anchorLink) {
         e.preventDefault();
@@ -2218,6 +2613,7 @@
         const el = document.getElementById(targetId);
         if (el) {
           el.scrollIntoView({ behavior: 'smooth' });
+          el.focus?.();
         }
         return;
       }
@@ -2248,7 +2644,7 @@
         if (tabType === 'talk') targetHash = `#/wiki/${encodeURIComponent(state.activeSlug)}/talk`;
         if (tabType === 'edit') targetHash = `#/wiki/${encodeURIComponent(state.activeSlug)}/edit`;
         if (tabType === 'history') targetHash = `#/wiki/${encodeURIComponent(state.activeSlug)}/history`;
-        
+
         if (window.location.hash === targetHash) {
           handleRoute();
         } else {
@@ -2301,7 +2697,7 @@
     // Nasłuchiwanie zmian hasha w adresie
     window.addEventListener('hashchange', handleRoute);
 
-    // Ukryty adres panelu: /panel → #/panel
+    // Przekierowanie ścieżki /panel → #/panel
     if (window.location.pathname.replace(/\/+$/, '') === '/panel') {
       history.replaceState(null, '', '/#/panel');
     }
@@ -2317,7 +2713,10 @@
     showToast,
     handleRoute,
     setAuthToken,
-    clearAuthToken
+    clearAuthToken,
+    parseCategories,
+    getCatName,
+    getCatCount
   };
 
   // Uruchomienie po załadowaniu DOM

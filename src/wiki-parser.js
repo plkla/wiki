@@ -24,10 +24,13 @@ function slugify(text) {
     'ó': 'o', 'Ó': 'o',
     'ś': 's', 'Ś': 's',
     'ź': 'z', 'Ź': 'z',
-    'ż': 'z', 'Ż': 'z'
+    'ż': 'z', 'Ż': 'z',
+    'ß': 'ss',
+    'ø': 'o', 'Ø': 'o',
+    'đ': 'd', 'Đ': 'd'
   };
 
-  const replaced = str.replace(/[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]/g, char => polishMap[char] || char);
+  const replaced = str.replace(/[ąćęłńóśźżĄĆĘŁŃÓŚŹŻßøØđĐ]/g, char => polishMap[char] || char);
 
   return replaced
     .normalize('NFD')
@@ -62,10 +65,15 @@ function escapeHtml(str) {
 function renderInline(text, slugSet, linksOut) {
   let res = text;
 
-  // Kod inline: `kod`
-  res = res.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  // 1. Zabezpieczenie kodu inline: `kod` przed formatowaniem markdown/wikitekstu
+  const inlineCodes = [];
+  res = res.replace(/`([^`\n]+)`/g, (match, code) => {
+    const token = `@@@INLINE_CODE_${inlineCodes.length}@@@`;
+    inlineCodes.push(`<code>${code}</code>`);
+    return token;
+  });
 
-  // Linki wiki: [[Cel|Etykieta]] lub [[Cel]]
+  // 2. Linki wiki: [[Cel|Etykieta]] lub [[Cel]]
   res = res.replace(/\[\[([^\]\n|]+)(?:\|([^\]\n]+))?\]\]/g, (match, targetRaw, labelRaw) => {
     const target = targetRaw.trim();
     const label = (labelRaw !== undefined ? labelRaw : target).trim();
@@ -83,17 +91,22 @@ function renderInline(text, slugSet, linksOut) {
     }
   });
 
-  // Pogrubienie i kursywa (MediaWiki ''''' oraz markdown ***) - obsługa również &#39;
-  res = res.replace(/(?:'''''|&#39;&#39;&#39;&#39;&#39;)(.+?)(?:'''''|&#39;&#39;&#39;&#39;&#39;)/g, '<strong><em>$1</em></strong>');
+  // 3. Pogrubienie i kursywa (MediaWiki ''''' oraz markdown ***) - obsługa również encji apostrofów
+  res = res.replace(/(?:'''''|&#39;&#39;&#39;&#39;&#39;|&#039;&#039;&#039;&#039;&#039;)(.+?)(?:'''''|&#39;&#39;&#39;&#39;&#39;|&#039;&#039;&#039;&#039;&#039;)/g, '<strong><em>$1</em></strong>');
   res = res.replace(/\*\*\*([^*\n]+)\*\*\*/g, '<strong><em>$1</em></strong>');
 
-  // Pogrubienie: '''tekst''' oraz **tekst** (oraz &#39;&#39;&#39;tekst&#39;&#39;&#39;)
-  res = res.replace(/(?:'''|&#39;&#39;&#39;)(.+?)(?:'''|&#39;&#39;&#39;)/g, '<strong>$1</strong>');
+  // 4. Pogrubienie: '''tekst''' oraz **tekst**
+  res = res.replace(/(?:'''|&#39;&#39;&#39;|&#039;&#039;&#039;)(.+?)(?:'''|&#39;&#39;&#39;|&#039;&#039;&#039;)/g, '<strong>$1</strong>');
   res = res.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
 
-  // Kursywa: ''tekst'' oraz *tekst* (oraz &#39;&#39;tekst&#39;&#39;)
-  res = res.replace(/(?:''|&#39;&#39;)(.+?)(?:''|&#39;&#39;)/g, '<em>$1</em>');
+  // 5. Kursywa: ''tekst'' oraz *tekst*
+  res = res.replace(/(?:''|&#39;&#39;|&#039;&#039;)(.+?)(?:''|&#39;&#39;|&#039;&#039;)/g, '<em>$1</em>');
   res = res.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+
+  // 6. Przywrócenie nienaruszonego kodu inline (funkcja zapobiega problemom z $ w tekście)
+  for (let idx = 0; idx < inlineCodes.length; idx++) {
+    res = res.replace(`@@@INLINE_CODE_${idx}@@@`, () => inlineCodes[idx]);
+  }
 
   return res;
 }
@@ -115,9 +128,9 @@ function renderWikiContent(rawText, existingSlugsSet = new Set()) {
 
   let sectionCounter = 1;
 
-  // 1. Ekstrakcja przypisów <ref>...</ref> PRZED escapowaniem HTML
+  // 1. Ekstrakcja przypisów <ref>...</ref> PRZED escapowaniem HTML (obsługa również atrybutów, np. <ref name="...">)
   const refTokens = [];
-  const textWithoutRefs = text.replace(/<ref>([\s\S]*?)<\/ref>/gi, (match, refContent) => {
+  const textWithoutRefs = text.replace(/<ref(?:\s+[^>]*)?>([\s\S]*?)<\/ref>/gi, (match, refContent) => {
     const cleanRef = refContent.trim();
     references.push(cleanRef);
     const refIndex = references.length;
@@ -127,7 +140,7 @@ function renderWikiContent(rawText, existingSlugsSet = new Set()) {
       html: `<sup class="wiki-ref" id="ref-cite-${refIndex}"><a href="#ref-note-${refIndex}">[${refIndex}]</a></sup>`
     });
     return token;
-  });
+  }).replace(/<references\s*\/?>/gi, '');
 
   // 2. Ekstrakcja bloków kodu ```...```
   const codeBlocks = [];
@@ -285,14 +298,14 @@ function renderWikiContent(rawText, existingSlugsSet = new Set()) {
 
   let finalHtml = renderedBlocks.join('\n\n');
 
-  // Przywrócenie bloków kodu
+  // Przywrócenie bloków kodu (użycie funkcji zapobiega interpretacji znaków $ w treści kodu)
   for (const cb of codeBlocks) {
-    finalHtml = finalHtml.replace(cb.token, cb.html);
+    finalHtml = finalHtml.replace(cb.token, () => cb.html);
   }
 
   // Przywrócenie przypisów w tekście
   for (const rf of refTokens) {
-    finalHtml = finalHtml.replaceAll(rf.token, rf.html);
+    finalHtml = finalHtml.replaceAll(rf.token, () => rf.html);
   }
 
   // Sekcja przypisów na dole (jeśli występują przypisy)
@@ -343,6 +356,34 @@ function computeLineDiff(oldText, newText) {
 
   if (m === 0 && n === 0) {
     return [];
+  }
+
+  // Szybka ścieżka: teksty identyczne
+  if (oldText === newText) {
+    return oldLines.map((line, idx) => ({
+      type: 'same',
+      line,
+      oldLineNum: idx + 1,
+      newLineNum: idx + 1
+    }));
+  }
+
+  // Szybka ścieżka: całkowicie nowy tekst
+  if (m === 0) {
+    return newLines.map((line, idx) => ({
+      type: 'add',
+      line,
+      newLineNum: idx + 1
+    }));
+  }
+
+  // Szybka ścieżka: całkowite usunięcie tekstu
+  if (n === 0) {
+    return oldLines.map((line, idx) => ({
+      type: 'del',
+      line,
+      oldLineNum: idx + 1
+    }));
   }
 
   // Macierz programowania dynamicznego (LCS)
