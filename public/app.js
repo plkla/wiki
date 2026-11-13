@@ -1058,6 +1058,7 @@
 
     // Ostrzeżenie o blokadzie artykułu
     const isLockedAndNotAdmin = Boolean(currentArticle.is_locked && (!state.currentUser || state.currentUser.role !== 'admin'));
+    const items = infoboxObj.items || {};
 
     viewRoot.innerHTML = `
       <div class="editor-container">
@@ -1333,7 +1334,6 @@
 
     // Obsługa wierszy infoboxu
     const infoboxContainer = document.getElementById('infobox-rows-container');
-    const items = infoboxObj.items || {};
 
     function updateInfoboxBadge() {
       const badge = document.getElementById('infobox-count-badge');
