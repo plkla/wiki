@@ -6,45 +6,20 @@
 (function () {
   'use strict';
 
-  // --- Bezpieczna obsługa localStorage z obsługą QuotaExceededError ---
-  function safeGetStorage(key) {
+  function getInitialTheme() {
     try {
-      return localStorage.getItem(key);
-    } catch {
-      return null;
-    }
-  }
-
-  function safeSetStorage(key, value) {
-    try {
-      localStorage.setItem(key, value);
-    } catch (e) {
-      // W przypadku przepełnienia limitu storage usuwamy starsze wersje robocze wiki_draft_* i ponawiamy
-      try {
-        const draftKeys = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i);
-          if (k && k.startsWith('wiki_draft_') && k !== key) {
-            draftKeys.push(k);
-          }
-        }
-        draftKeys.forEach(k => {
-          try { localStorage.removeItem(k); } catch {}
-        });
-        localStorage.setItem(key, value);
-      } catch {}
-    }
-  }
-
-  function safeRemoveStorage(key) {
-    try {
-      localStorage.removeItem(key);
-    } catch {}
+      const saved = localStorage.getItem('wiki_theme');
+      if (saved === 'dark' || saved === 'light') return saved;
+      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        return 'dark';
+      }
+    } catch (_) {}
+    return 'light';
   }
 
   // --- Stan aplikacji ---
   const state = {
-    token: safeGetStorage('wiki_token') || '',
+    token: localStorage.getItem('wiki_token') || '',
     currentUser: null,
     settings: {
       site_name: 'WikiKurekk',
@@ -60,44 +35,47 @@
     },
     categories: [],
     allSlugs: [],
+    articleTitlesBySlug: {},
     activeSlug: null,
     adminActiveTab: 'kpi',
     currentRoute: null,
-    theme: safeGetStorage('wiki_theme') || 'light'
+    theme: getInitialTheme()
   };
 
-  // Referencja do ostatniego elementu, który otworzył modal (dla dostępności)
-  let lastFocusedElementBeforeModal = null;
+  let activeEditorGuard = null;
+  let isBypassingHashGuard = false;
+  let isPromptingLeave = false;
+  let lastAuthExpiredToastAt = 0;
+  let lastAuthTriggerEl = null;
 
   // --- Motyw jasny / ciemny ---
   function applyTheme(theme) {
     const clean = theme === 'dark' ? 'dark' : 'light';
     state.theme = clean;
     document.documentElement.setAttribute('data-theme', clean);
-    safeSetStorage('wiki_theme', clean);
+    try {
+      localStorage.setItem('wiki_theme', clean);
+    } catch (_) {}
     const btn = document.getElementById('theme-toggle-btn');
     if (btn) {
       btn.textContent = clean === 'dark' ? 'Jasny motyw' : 'Ciemny motyw';
+      btn.setAttribute('aria-pressed', clean === 'dark' ? 'true' : 'false');
     }
   }
 
-  // Uprawnienia edycji encyklopedii: wyłącznie zalogowany admin lub editor
+  // Uprawnienia edycji encyklopedii
   function canEditWiki() {
-    return Boolean(state.currentUser && (state.currentUser.role === 'admin' || state.currentUser.role === 'editor'));
-  }
-
-  // Aktualizacja tytułu zakładki w przeglądarce
-  function setPageTitle(subTitle = '') {
-    const siteName = (state.settings && state.settings.site_name) || 'WikiKurekk';
-    if (subTitle) {
-      document.title = `${subTitle} – ${siteName}`;
-    } else {
-      const tagline = (state.settings && state.settings.site_tagline) || 'Wolna encyklopedia';
-      document.title = `${siteName} – ${tagline}`;
+    if (state.currentUser && state.currentUser.role === 'blocked') return false;
+    if (state.currentUser && (state.currentUser.role === 'admin' || state.currentUser.role === 'editor')) {
+      return true;
     }
+    if (String(state.settings.allow_anonymous_edits) === '1') {
+      return true;
+    }
+    return false;
   }
 
-  // --- Pomocnicze funkcje tekstowe i formatowania ---
+  // --- Pomocnicze funkcje tekstowe, URL i formatowania ---
   function escapeHtml(str) {
     if (str === null || str === undefined) return '';
     return String(str)
@@ -108,43 +86,22 @@
       .replace(/'/g, '&#039;');
   }
 
-  function formatDate(dateStr) {
-    if (!dateStr) return '';
-    const d = new Date(dateStr);
-    if (isNaN(d.getTime())) return String(dateStr);
-    return d.toLocaleString('pl-PL', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit'
-    });
-  }
-
-  // Bezpieczna walidacja URL obrazu
-  function sanitizeImageUrl(url) {
-    if (!url || typeof url !== 'string') return '';
-    const clean = url.trim();
-    if (/^(https?:\/\/|\/|data:image\/)/i.test(clean)) {
-      return clean;
+  function isSafeUrl(url) {
+    const str = String(url || '').trim();
+    if (!str) return false;
+    if (/^\/(?!\/)/.test(str)) return true;
+    try {
+      const parsed = new URL(str);
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch {
+      return false;
     }
-    return '';
   }
 
-  // Bezpieczne renderowanie snippetów wyszukiwania FTS5 z zachowaniem tagów <mark>
-  function renderSearchSnippet(snippet) {
-    if (!snippet) return '';
-    return escapeHtml(snippet)
-      .replace(/&lt;mark(?:\s+class=&quot;([^&]*)&quot;)?&gt;/gi, '<mark class="search-highlight">')
-      .replace(/&lt;\/mark&gt;/gi, '</mark>');
-  }
-
-  // Generowanie sluga zgodne z wiki-parser.js
-  function slugify(text) {
+  function slugifyTitle(text) {
     if (text == null) return '';
     const str = String(text).trim();
     if (!str) return '';
-
     const polishMap = {
       'ą': 'a', 'Ą': 'a',
       'ć': 'c', 'Ć': 'c',
@@ -154,14 +111,9 @@
       'ó': 'o', 'Ó': 'o',
       'ś': 's', 'Ś': 's',
       'ź': 'z', 'Ź': 'z',
-      'ż': 'z', 'Ż': 'z',
-      'ß': 'ss',
-      'ø': 'o', 'Ø': 'o',
-      'đ': 'd', 'Đ': 'd'
+      'ż': 'z', 'Ż': 'z'
     };
-
-    const replaced = str.replace(/[ąćęłńóśźżĄĆĘŁŃÓŚŹŻßøØđĐ]/g, char => polishMap[char] || char);
-
+    const replaced = str.replace(/[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]/g, ch => polishMap[ch] || ch);
     return replaced
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
@@ -170,20 +122,17 @@
       .replace(/^-+|-+$/g, '');
   }
 
-  // Przełączanie globalnego trybu Zen
-  function toggleZenMode(force) {
-    const isZen = force !== undefined ? force : !document.body.classList.contains('editor-zen-active');
-    if (isZen) {
-      document.body.classList.add('editor-zen-active');
-    } else {
-      document.body.classList.remove('editor-zen-active');
-    }
-    const btn = document.getElementById('zen-toggle-btn');
-    if (btn) {
-      btn.innerHTML = isZen ? '✕ Wyjdź z Zen' : '⛶ Tryb Zen';
-      btn.setAttribute('aria-pressed', isZen ? 'true' : 'false');
-    }
-    return isZen;
+  function formatDate(dateStr) {
+    if (!dateStr) return '';
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return dateStr;
+    return d.toLocaleString('pl-PL', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
   }
 
   // --- Pomocnicze funkcje kategorii ---
@@ -195,25 +144,30 @@
     return (c && typeof c === 'object' && typeof c.count === 'number') ? c.count : null;
   }
 
-  // Bezpieczne parsowanie listy kategorii z obiektu artykułu
-  function parseCategories(catData) {
-    if (!catData) return [];
-    if (Array.isArray(catData)) {
-      return catData.map(c => getCatName(c)).filter(Boolean);
+  function parseCategories(raw) {
+    if (Array.isArray(raw)) {
+      return raw.map(c => getCatName(c).trim()).filter(Boolean);
     }
-    if (typeof catData === 'string') {
-      const trimmed = catData.trim();
-      if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
-        try {
-          const parsed = JSON.parse(trimmed);
-          if (Array.isArray(parsed)) {
-            return parsed.map(c => getCatName(c)).filter(Boolean);
-          }
-        } catch {}
+    if (!raw) return [];
+    if (typeof raw === 'string') {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed.map(c => getCatName(c).trim()).filter(Boolean);
+        }
+      } catch {
+        return raw.split(',').map(s => s.trim()).filter(Boolean);
       }
-      return trimmed.split(',').map(s => s.trim()).filter(Boolean);
     }
     return [];
+  }
+
+  function stripSnippetFootnotes(html) {
+    if (!html) return '';
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    tmp.querySelectorAll('sup.wiki-ref, .wiki-references').forEach(el => el.remove());
+    return tmp.innerHTML;
   }
 
   // --- System powiadomień Toast ---
@@ -223,12 +177,6 @@
 
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
-    toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
-
-    if (type === 'warning') {
-      toast.style.backgroundColor = '#d97706';
-      toast.style.color = '#ffffff';
-    }
 
     const icons = {
       success: '✅',
@@ -239,9 +187,9 @@
     const icon = icons[type] || 'ℹ️';
 
     toast.innerHTML = `
-      <span class="toast-icon" aria-hidden="true">${icon}</span>
+      <span class="toast-icon">${icon}</span>
       <span class="toast-message">${escapeHtml(message)}</span>
-      <button class="toast-close" type="button" aria-label="Zamknij powiadomienie">&times;</button>
+      <button class="toast-close" type="button" aria-label="Zamknij">&times;</button>
     `;
 
     const closeBtn = toast.querySelector('.toast-close');
@@ -252,33 +200,98 @@
       toast.classList.add('toast-fade-out');
       setTimeout(() => {
         if (toast.parentNode) toast.parentNode.removeChild(toast);
-      }, 250);
+      }, 300);
     };
 
     closeBtn.addEventListener('click', removeToast);
     container.appendChild(toast);
-    timer = setTimeout(removeToast, 3800);
+    timer = setTimeout(removeToast, 3500);
   }
 
-  // Eksport globalny showToast
   window.showToast = showToast;
+
+  // --- Niestandardowy modal potwierdzenia (.modal-backdrop / .modal-card) ---
+  function showConfirmModal({
+    title = 'Potwierdzenie',
+    message = '',
+    confirmText = 'Potwierdź',
+    cancelText = 'Anuluj',
+    danger = false
+  } = {}) {
+    return new Promise((resolve) => {
+      const previousActive = document.activeElement;
+      const backdrop = document.createElement('div');
+      backdrop.className = 'modal-backdrop confirm-modal-backdrop';
+      backdrop.setAttribute('role', 'dialog');
+      backdrop.setAttribute('aria-modal', 'true');
+      backdrop.setAttribute('aria-labelledby', 'confirm-modal-title');
+
+      backdrop.innerHTML = `
+        <div class="modal-card confirm-modal-card">
+          <div class="modal-header">
+            <h3 id="confirm-modal-title" class="modal-title">${escapeHtml(title)}</h3>
+            <button type="button" class="modal-close confirm-close-x" aria-label="Zamknij okno">&times;</button>
+          </div>
+          <div class="modal-body">
+            <p class="confirm-modal-message">${escapeHtml(message)}</p>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline confirm-cancel-btn">${escapeHtml(cancelText)}</button>
+            <button type="button" class="btn ${danger ? 'btn-danger' : 'btn-primary'} confirm-ok-btn">${escapeHtml(confirmText)}</button>
+          </div>
+        </div>
+      `;
+
+      let resolved = false;
+      const cleanup = (result) => {
+        if (resolved) return;
+        resolved = true;
+        document.removeEventListener('keydown', onKeyDown, true);
+        if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+        if (previousActive && typeof previousActive.focus === 'function' && document.contains(previousActive)) {
+          previousActive.focus();
+        }
+        resolve(result);
+      };
+
+      const onKeyDown = (e) => {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          cleanup(false);
+        }
+      };
+
+      backdrop.addEventListener('click', (e) => {
+        if (e.target === backdrop) cleanup(false);
+      });
+      backdrop.querySelector('.confirm-close-x').addEventListener('click', () => cleanup(false));
+      backdrop.querySelector('.confirm-cancel-btn').addEventListener('click', () => cleanup(false));
+      backdrop.querySelector('.confirm-ok-btn').addEventListener('click', () => cleanup(true));
+
+      document.addEventListener('keydown', onKeyDown, true);
+      document.body.appendChild(backdrop);
+      backdrop.querySelector(danger ? '.confirm-cancel-btn' : '.confirm-ok-btn').focus();
+    });
+  }
 
   // --- Komunikacja z API ---
   async function api(path, options = {}) {
+    const fetchOpts = Object.assign({}, options);
     const headers = Object.assign({}, options.headers || {});
 
-    if (options.body && typeof options.body === 'object' && !(options.body instanceof FormData)) {
+    if (fetchOpts.body && typeof fetchOpts.body === 'object' && !(fetchOpts.body instanceof FormData)) {
       headers['Content-Type'] = 'application/json';
-      options.body = JSON.stringify(options.body);
+      fetchOpts.body = JSON.stringify(fetchOpts.body);
     }
 
     if (state.token) {
       headers['Authorization'] = `Bearer ${state.token}`;
       headers['X-Wiki-Token'] = state.token;
     }
-    options.headers = headers;
+    fetchOpts.headers = headers;
 
-    const res = await fetch(path, options);
+    const res = await fetch(path, fetchOpts);
     let data = null;
     const contentType = res.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
@@ -288,6 +301,21 @@
     }
 
     if (!res.ok) {
+      if (
+        res.status === 401 &&
+        state.token &&
+        !options.suppressAuthExpiry &&
+        !path.startsWith('/api/auth/login') &&
+        !path.startsWith('/api/auth/register')
+      ) {
+        clearAuthToken();
+        const now = Date.now();
+        if (now - lastAuthExpiredToastAt > 3000) {
+          lastAuthExpiredToastAt = now;
+          showToast('Sesja wygasła. Zaloguj się ponownie.', 'warning');
+        }
+      }
+
       const errorMsg = (data && data.error) ? data.error : `Błąd serwera (${res.status})`;
       const error = new Error(errorMsg);
       error.status = res.status;
@@ -301,34 +329,103 @@
   function setAuthToken(token, user = null) {
     state.token = token;
     state.currentUser = user;
-    safeSetStorage('wiki_token', token);
+    localStorage.setItem('wiki_token', token);
     updateHeaderAndSidebar();
   }
 
   function clearAuthToken() {
     state.token = '';
     state.currentUser = null;
-    safeRemoveStorage('wiki_token');
+    localStorage.removeItem('wiki_token');
+    resetAuthForms();
     updateHeaderAndSidebar();
+  }
+
+  function resetAuthForms() {
+    document.getElementById('login-form')?.reset();
+    document.getElementById('register-form')?.reset();
+    ['login-error', 'register-error'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.textContent = '';
+        el.classList.add('hidden');
+      }
+    });
+  }
+
+  async function refreshBootstrapMetadata() {
+    try {
+      const boot = await api('/api/bootstrap', { suppressAuthExpiry: true });
+      state.settings = boot.settings || state.settings;
+      state.stats = boot.stats || state.stats;
+      state.categories = boot.categories || state.categories;
+      state.allSlugs = boot.allSlugs || state.allSlugs;
+      if (boot.currentUser !== undefined) {
+        state.currentUser = boot.currentUser;
+      }
+      if (Array.isArray(boot.recentArticles)) {
+        boot.recentArticles.forEach(a => {
+          if (a && a.slug && a.title) state.articleTitlesBySlug[a.slug] = a.title;
+        });
+      }
+      updateHeaderAndSidebar();
+    } catch (_) {}
+  }
+
+  // --- Szuflada boczna na urządzeniach mobilnych ---
+  function setSidebarOpen(open) {
+    const sidebar = document.getElementById('wiki-sidebar');
+    const backdrop = document.getElementById('sidebar-backdrop');
+    const toggleBtn = document.getElementById('sidebar-toggle-btn');
+    const isOpen = Boolean(open);
+    if (sidebar) sidebar.classList.toggle('is-open', isOpen);
+    if (backdrop) {
+      backdrop.classList.toggle('is-open', isOpen);
+      backdrop.classList.toggle('hidden', !isOpen);
+    }
+    if (toggleBtn) {
+      toggleBtn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+    }
+  }
+
+  function initSidebarDrawer() {
+    const toggleBtn = document.getElementById('sidebar-toggle-btn');
+    const backdrop = document.getElementById('sidebar-backdrop');
+    const sidebar = document.getElementById('wiki-sidebar');
+
+    if (toggleBtn && sidebar) {
+      toggleBtn.addEventListener('click', () => {
+        setSidebarOpen(!sidebar.classList.contains('is-open'));
+      });
+    }
+    if (backdrop) {
+      backdrop.addEventListener('click', () => setSidebarOpen(false));
+    }
+    if (sidebar) {
+      sidebar.addEventListener('click', (e) => {
+        if (e.target.closest('a, button')) {
+          setSidebarOpen(false);
+        }
+      });
+    }
   }
 
   // --- Aktualizacja Nagłówka, Paska bocznego i Banera ---
   function updateHeaderAndSidebar() {
-    // Tytuły strony
     const siteNameEl = document.getElementById('site-name-label');
     const siteTaglineEl = document.getElementById('site-tagline-label');
     if (siteNameEl) siteNameEl.textContent = state.settings.site_name || 'WikiKurekk';
     if (siteTaglineEl) siteTaglineEl.textContent = state.settings.site_tagline || 'Wolna encyklopedia';
 
-    // Baner ogłoszeniowy na samej górze witryny
+    // Baner ogłoszeniowy
     const bannerEl = document.getElementById('announcement-banner');
     if (bannerEl) {
-      const bannerText = (state.settings && state.settings.announcement_banner) ? state.settings.announcement_banner.trim() : '';
+      const bannerText = (state.settings.announcement_banner || '').trim();
       if (bannerText) {
-        bannerEl.textContent = bannerText;
+        bannerEl.innerHTML = `<span class="announcement-icon" aria-hidden="true">📢</span> <span class="announcement-text">${escapeHtml(bannerText)}</span>`;
         bannerEl.classList.remove('hidden');
       } else {
-        bannerEl.textContent = '';
+        bannerEl.innerHTML = '';
         bannerEl.classList.add('hidden');
       }
     }
@@ -339,33 +436,28 @@
     const authModalBtn = document.getElementById('auth-modal-btn');
     const registerModalBtn = document.getElementById('register-modal-btn');
     const navAdminTop = document.getElementById('nav-admin-top');
-    const navWatchlistTop = document.getElementById('nav-watchlist-top');
 
     if (userBadgeEl) {
       if (state.currentUser) {
         userBadgeEl.textContent = state.currentUser.username;
         userBadgeEl.classList.remove('hidden');
         if (logoutBtn) logoutBtn.classList.remove('hidden');
-        if (navWatchlistTop) navWatchlistTop.classList.remove('hidden');
         if (authModalBtn) authModalBtn.classList.add('hidden');
         if (registerModalBtn) registerModalBtn.classList.add('hidden');
       } else {
         userBadgeEl.textContent = '';
         userBadgeEl.classList.add('hidden');
         if (logoutBtn) logoutBtn.classList.add('hidden');
-        if (navWatchlistTop) navWatchlistTop.classList.add('hidden');
         if (authModalBtn) authModalBtn.classList.remove('hidden');
         if (registerModalBtn) registerModalBtn.classList.remove('hidden');
       }
     }
 
-    // Link do panelu – widoczny wyłącznie dla zalogowanego administratora
     if (navAdminTop) {
       const isAdmin = !!(state.currentUser && state.currentUser.role === 'admin');
       navAdminTop.classList.toggle('hidden', !isAdmin);
     }
 
-    // Sekcja współtworzenia w pasku bocznym – widoczna tylko dla admina i edytora
     const createLink = document.querySelector('.wiki-sidebar .nav-link-create');
     if (createLink) {
       const canEdit = canEditWiki();
@@ -376,7 +468,6 @@
       }
     }
 
-    // Statystyki paska bocznego
     const sidebarStatsEl = document.getElementById('sidebar-stats');
     if (sidebarStatsEl) {
       sidebarStatsEl.innerHTML = `
@@ -386,7 +477,6 @@
       `;
     }
 
-    // Kategorie paska bocznego (kompaktowa lista z limitem i linkiem do pełnego spisu)
     const sidebarCategoriesEl = document.getElementById('sidebar-categories');
     if (sidebarCategoriesEl && state.categories) {
       if (state.categories.length === 0) {
@@ -409,7 +499,6 @@
       }
     }
 
-    // Podświetlenie aktywnego linku w sidebarze
     const currentHash = window.location.hash || '#/';
     document.querySelectorAll('.wiki-sidebar .nav-link').forEach(link => {
       const href = link.getAttribute('href');
@@ -450,24 +539,18 @@
       tabEdit.classList.toggle('hidden', !canEditWiki());
     }
 
-    if (activeTab === 'read' && tabRead) {
-      tabRead.classList.add('active');
-      tabRead.setAttribute('aria-selected', 'true');
-    }
-    if (activeTab === 'talk' && tabTalk) {
-      tabTalk.classList.add('active');
-      tabTalk.setAttribute('aria-selected', 'true');
-    }
-    if (activeTab === 'edit' && tabEdit) {
-      tabEdit.classList.add('active');
-      tabEdit.setAttribute('aria-selected', 'true');
-    }
-    if (activeTab === 'history' && tabHistory) {
-      tabHistory.classList.add('active');
-      tabHistory.setAttribute('aria-selected', 'true');
+    const activeMap = {
+      read: tabRead,
+      talk: tabTalk,
+      edit: tabEdit,
+      history: tabHistory
+    };
+    const activeEl = activeMap[activeTab];
+    if (activeEl) {
+      activeEl.classList.add('active');
+      activeEl.setAttribute('aria-selected', 'true');
     }
 
-    // Aktualizacja liczników badge
     const revBadge = document.getElementById('rev-count-badge');
     if (revBadge && revCount !== undefined) {
       revBadge.textContent = revCount;
@@ -478,27 +561,54 @@
     }
   }
 
-  // --- Renderowanie Infoboxu ---
-  function renderInfobox(infoboxData, fallbackTitle = '') {
-    if (!infoboxData) return '';
-    let data = infoboxData;
-    if (typeof data === 'string') {
+  // --- Normalizacja i renderowanie Infoboxu ---
+  /**
+   * Normalizes raw infobox payloads (null, JSON string, legacy flat object, or { title, image, items }).
+   */
+  function normalizeInfobox(rawInfobox) {
+    const result = { title: '', image: '', items: {} };
+    if (!rawInfobox) return result;
+
+    let parsed = rawInfobox;
+    if (typeof parsed === 'string') {
       try {
-        data = JSON.parse(data);
+        parsed = JSON.parse(parsed);
       } catch {
-        return '';
+        return result;
       }
     }
-    if (!data || typeof data !== 'object') return '';
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return result;
+    }
 
-    const title = data.title || fallbackTitle;
-    const rawImage = data.image || '';
-    const image = sanitizeImageUrl(rawImage);
-    const items = (data.items && typeof data.items === 'object') ? data.items : data;
+    result.title = (parsed.title !== undefined && parsed.title !== null && typeof parsed.title !== 'object')
+      ? String(parsed.title)
+      : '';
+    result.image = (parsed.image !== undefined && parsed.image !== null && typeof parsed.image !== 'object')
+      ? String(parsed.image)
+      : '';
+
+    const sourceItems = (parsed.items && typeof parsed.items === 'object' && !Array.isArray(parsed.items))
+      ? parsed.items
+      : parsed;
+
+    for (const [key, val] of Object.entries(sourceItems)) {
+      if (key === 'title' || key === 'image' || key === 'items') continue;
+      if (val !== undefined && val !== null && val !== '') {
+        result.items[key] = typeof val === 'object' ? JSON.stringify(val) : String(val);
+      }
+    }
+
+    return result;
+  }
+
+  function renderInfobox(infoboxData, fallbackTitle = '') {
+    const normalized = normalizeInfobox(infoboxData);
+    const title = normalized.title || fallbackTitle;
+    const image = isSafeUrl(normalized.image) ? normalized.image.trim() : '';
 
     let rowsHtml = '';
-    for (const [key, val] of Object.entries(items)) {
-      if (key === 'title' || key === 'image' || key === 'items') continue;
+    for (const [key, val] of Object.entries(normalized.items)) {
       if (val !== undefined && val !== null && val !== '') {
         rowsHtml += `
           <tr>
@@ -512,14 +622,16 @@
     if (!rowsHtml && !image) return '';
 
     return `
-      <aside class="wiki-infobox" aria-label="Informacje encyklopedyczne">
-        ${title ? `<div class="wiki-infobox-header infobox-title">${escapeHtml(title)}</div>` : ''}
-        ${image ? `<div class="wiki-infobox-image infobox-image"><img src="${escapeHtml(image)}" alt="${escapeHtml(title)}" loading="lazy" /></div>` : ''}
-        <table class="infobox-table">
-          <tbody>
-            ${rowsHtml}
-          </tbody>
-        </table>
+      <aside class="wiki-infobox">
+        ${title ? `<div class="infobox-title">${escapeHtml(title)}</div>` : ''}
+        ${image ? `<div class="infobox-image"><img src="${escapeHtml(image)}" alt="${escapeHtml(title || 'Ilustracja')}" loading="lazy" /></div>` : ''}
+        ${rowsHtml ? `
+          <table class="infobox-table">
+            <tbody>
+              ${rowsHtml}
+            </tbody>
+          </table>
+        ` : ''}
       </aside>
     `;
   }
@@ -528,12 +640,12 @@
   function renderToc(toc) {
     if (!toc || !Array.isArray(toc) || toc.length === 0) return '';
     return `
-      <nav class="wiki-toc" id="article-toc" aria-label="Spis treści">
+      <nav class="wiki-toc" aria-label="Spis treści">
         <div class="wiki-toc-header">
-          <strong class="wiki-toc-title">Spis treści</strong>
-          <button type="button" class="wiki-toc-toggle link-btn" id="toc-toggle-btn" aria-expanded="true" aria-controls="toc-list-ul">[ukryj]</button>
+          <div class="toc-title">Spis treści</div>
+          <button type="button" class="wiki-toc-toggle" aria-expanded="true">Ukryj</button>
         </div>
-        <ul class="toc-list" id="toc-list-ul">
+        <ul class="toc-list">
           ${toc.map(item => `
             <li class="toc-item toc-level-${item.level || 2}">
               <a href="#${escapeHtml(item.id)}" class="toc-link">${escapeHtml(item.text)}</a>
@@ -544,12 +656,43 @@
     `;
   }
 
+  // --- Nawigacja z ochroną niezapisanych zmian w edytorze ---
+  async function confirmLeaveEditorIfDirty() {
+    if (!activeEditorGuard || !activeEditorGuard.isDirty()) return true;
+    if (isPromptingLeave) return false;
+    isPromptingLeave = true;
+    try {
+      const ok = await showConfirmModal({
+        title: 'Niezapisane zmiany',
+        message: 'Masz niezapisane zmiany w edytorze. Czy na pewno chcesz opuścić tę stronę i je utracić?',
+        confirmText: 'Opuść bez zapisywania',
+        cancelText: 'Zostań w edytorze',
+        danger: true
+      });
+      if (ok && activeEditorGuard) {
+        activeEditorGuard.cleanup();
+        activeEditorGuard = null;
+      }
+      return ok;
+    } finally {
+      isPromptingLeave = false;
+    }
+  }
+
+  async function navigateWithGuard(targetHash) {
+    const canLeave = await confirmLeaveEditorIfDirty();
+    if (!canLeave) return;
+    if (window.location.hash === targetHash) {
+      handleRoute();
+    } else {
+      window.location.hash = targetHash;
+    }
+  }
+
   // --- WIDOK 1: Strona Główna (#/) ---
   async function renderHomePage() {
     updateArticleTabs(null);
-    setPageTitle();
     const viewRoot = document.getElementById('view-root');
-    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie encyklopedii...</div>';
 
     try {
@@ -560,18 +703,26 @@
       state.allSlugs = data.allSlugs || state.allSlugs;
       if (data.currentUser !== undefined) state.currentUser = data.currentUser;
       updateHeaderAndSidebar();
-      setPageTitle();
 
       const featured = data.featuredArticle;
       const recentArticles = data.recentArticles || [];
+      recentArticles.forEach(a => {
+        if (a && a.slug && a.title) state.articleTitlesBySlug[a.slug] = a.title;
+      });
+      if (featured && featured.slug && featured.title) {
+        state.articleTitlesBySlug[featured.slug] = featured.title;
+      }
 
-      // Ciekawe fakty do ramki "Czy wiesz, że..."
+      const featuredSnippetHtml = featured && featured.renderedHtml
+        ? stripSnippetFootnotes(featured.renderedHtml.split(/<h[23]\b/i)[0] || '')
+        : '';
+
       const didYouKnowFacts = [
-        '...że Mikołaj Kopernik w dziele <em>De revolutionibus orbium coelestium</em> sformułował heliocentryczną teorię Układu Słonecznego, wywołując przełom w nowożytnej nauce?',
-        '...że Maria Skłodowska-Curie jest jedyną kobietą wyróżnioną dwiema Nagrodami Nobla w dwóch różnych dziedzinach nauk ścisłych: fizyce i chemii?',
-        '...że Warszawa stała się stolicą Polski pod koniec XVI wieku po decyzji króla Zygmunta III Wazy o przeniesieniu dworu z Krakowa?',
-        '...że język JavaScript powstał w maju 1995 roku w laboratoriach firmy Netscape w zaledwie 10 dni dzięki Brendanowi Eichowi?',
-        '...że Polska była jednym z pierwszych krajów na świecie, które wprowadziły konstytucję pisaną (Konstytucja 3 Maja z 1791 r.)?'
+        '…że Mikołaj Kopernik w dziele <em>De revolutionibus orbium coelestium</em> sformułował heliocentryczną teorię Układu Słonecznego, wywołując przełom w nowożytnej nauce?',
+        '…że Maria Skłodowska-Curie jest jedyną kobietą wyróżnioną dwiema Nagrodami Nobla w dwóch różnych dziedzinach nauk ścisłych: fizyce i chemii?',
+        '…że Warszawa stała się stolicą Polski pod koniec XVI wieku po decyzji króla Zygmunta III Wazy o przeniesieniu dworu z Krakowa?',
+        '…że język JavaScript powstał w maju 1995 roku w laboratoriach firmy Netscape w zaledwie 10 dni dzięki Brendanowi Eichowi?',
+        '…że Polska była jednym z pierwszych krajów na świecie, które wprowadziły konstytucję pisaną (Konstytucja 3 maja z 1791 r.)?'
       ];
 
       viewRoot.innerHTML = `
@@ -579,16 +730,16 @@
           <div class="welcome-banner">
             <div class="welcome-banner-main">
               <h1>Witaj w ${escapeHtml(state.settings.site_name)}</h1>
-              <p class="welcome-lead">Otwarta encyklopedia tworzona przez redaktorów.</p>
+              <p class="welcome-lead">${escapeHtml(state.settings.site_tagline || 'Otwarta encyklopedia tworzona przez redaktorów.')}</p>
             </div>
             <div class="welcome-banner-aside">
-              <div class="welcome-stat-count"><strong>${state.stats.articlesCount || 0}</strong> haseł encyklopedycznych</div>
+              <div class="welcome-stat-count"><strong>${state.stats.articlesCount || 0}</strong> haseł encyklopedycznych · <strong>${state.stats.revisionsCount || 0}</strong> wersji</div>
               <div class="welcome-links">
                 <a href="#/articles">Indeks haseł</a>
                 <span class="welcome-sep">&middot;</span>
                 <a href="#/categories">Kategorie</a>
                 <span class="welcome-sep">&middot;</span>
-                <button type="button" id="main-random-btn" class="welcome-link-btn link-btn">Losowy artykuł</button>
+                <button type="button" id="main-random-btn" class="welcome-link-btn">Losowy artykuł</button>
                 ${canEditWiki() ? `<span class="welcome-sep">&middot;</span><a href="#/new">Utwórz hasło</a>` : ''}
               </div>
             </div>
@@ -596,23 +747,22 @@
         </div>
 
         <div class="main-page-grid">
-          <!-- Karta Artykułu Wyróżnionego -->
           <div class="main-col-left">
             <section class="main-card card-featured">
               <div class="card-header">
                 <h2>Artykuł wyróżniony</h2>
-                ${featured ? `<a href="#/wiki/${encodeURIComponent(featured.slug)}" class="card-header-link">${escapeHtml(featured.title)} &rarr;</a>` : ''}
+                ${featured ? `<a href="#/wiki/${featured.slug}" class="card-header-link">${escapeHtml(featured.title)} &rarr;</a>` : ''}
               </div>
               <div class="card-body clearfix">
                 ${featured ? `
                   ${renderInfobox(featured.infobox, featured.title)}
-                  <h3 class="featured-article-heading"><a href="#/wiki/${encodeURIComponent(featured.slug)}">${escapeHtml(featured.title)}</a></h3>
-                  <p class="featured-summary">${escapeHtml(featured.summary || '')}</p>
+                  <h3 class="featured-article-heading"><a href="#/wiki/${featured.slug}">${escapeHtml(featured.title)}</a></h3>
+                  ${featured.summary ? `<p class="featured-summary">${escapeHtml(featured.summary)}</p>` : ''}
                   <div class="featured-content-snippet">
-                    ${featured.renderedHtml ? (featured.renderedHtml.split(/<h[23]\b/i)[0] || '') : ''}
+                    ${featuredSnippetHtml}
                   </div>
                   <div class="card-footer-link">
-                    <a href="#/wiki/${encodeURIComponent(featured.slug)}">Czytaj cały artykuł &rarr;</a>
+                    <a href="#/wiki/${featured.slug}">Czytaj cały artykuł &rarr;</a>
                   </div>
                 ` : `
                   <p>Obecnie żaden artykuł nie jest oznaczony jako wyróżniony.</p>
@@ -620,7 +770,6 @@
               </div>
             </section>
 
-            <!-- Działy i kategorie -->
             <section class="main-card card-categories">
               <div class="card-header">
                 <h2>Działy tematyczne</h2>
@@ -628,7 +777,7 @@
               </div>
               <div class="card-body">
                 <div class="categories-index-list">
-                  ${state.categories.length === 0 ? '<p>Brak zdefiniowanych kategorii.</p>' : state.categories.map(cat => {
+                  ${state.categories.map(cat => {
                     const name = getCatName(cat);
                     const count = getCatCount(cat);
                     return `
@@ -643,7 +792,6 @@
             </section>
           </div>
 
-          <!-- Prawa kolumna: Czy wiesz że + Ostatnie zmiany -->
           <div class="main-col-right">
             <section class="main-card card-did-you-know">
               <div class="card-header">
@@ -662,12 +810,12 @@
               </div>
               <div class="card-body">
                 <ul class="recent-list">
-                  ${recentArticles.length === 0 ? '<li class="recent-item"><em>Brak ostatnich zmian</em></li>' : recentArticles.slice(0, 6).map(art => {
+                  ${recentArticles.slice(0, 6).map(art => {
                     const slug = art.slug || art.article_slug;
                     const title = art.title || slug;
                     return `
                       <li class="recent-item">
-                        <a href="#/wiki/${encodeURIComponent(slug)}" class="recent-title">${escapeHtml(title)}</a>
+                        <a href="#/wiki/${slug}" class="recent-title">${escapeHtml(title)}</a>
                         <span class="recent-meta">${formatDate(art.updated_at || art.created_at)}</span>
                       </li>
                     `;
@@ -687,77 +835,49 @@
         mainRandomBtn.addEventListener('click', async () => {
           try {
             const r = await api('/api/articles/random');
-            if (r.slug) {
-              const targetHash = `#/wiki/${encodeURIComponent(r.slug)}`;
-              if (window.location.hash === targetHash) {
-                handleRoute();
-              } else {
-                window.location.hash = targetHash;
-              }
-            }
+            if (r.slug) window.location.hash = `#/wiki/${r.slug}`;
           } catch (e) {
             showToast(e.message, 'error');
           }
         });
       }
-
     } catch (err) {
-      viewRoot.innerHTML = `
-        <div class="wiki-error">
-          <p>Nie udało się załadować danych strony głównej: ${escapeHtml(err.message)}</p>
-          <button type="button" class="btn btn-secondary" onclick="window.wikiApp.handleRoute()">Spróbuj ponownie</button>
-        </div>
-      `;
+      viewRoot.innerHTML = `<div class="wiki-error">Nie udało się załadować danych strony głównej: ${escapeHtml(err.message)}</div>`;
     }
   }
 
-  // --- WIDOK 2: Artykuł (#/wiki/:slug) z obsługą Watchlist ---
+  // --- WIDOK 2: Artykuł (#/wiki/:slug) ---
   async function renderArticleView(slug) {
     const viewRoot = document.getElementById('view-root');
-    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie artykułu...</div>';
 
     try {
       const data = await api(`/api/articles/${encodeURIComponent(slug)}`);
       const art = data.article;
-      setPageTitle(art.title);
+      if (art && art.slug && art.title) {
+        state.articleTitlesBySlug[art.slug] = art.title;
+      }
       updateArticleTabs(slug, 'read', data.revisionsCount, data.talkCount);
 
-      // Sprawdzenie statusu obserwowania artykułu (jeśli zalogowany)
-      let isWatching = Boolean(data.isWatching);
-      if (state.currentUser && data.isWatching === undefined) {
-        try {
-          const wl = await api('/api/watchlist').catch(() => null);
-          const watchedList = (wl && (wl.watchlist || wl.articles)) ? (wl.watchlist || wl.articles) : [];
-          isWatching = watchedList.some(item => (item.slug === slug || item.article_slug === slug));
-        } catch {}
-      }
-
       const badgesHtml = [];
-      if (art.is_locked) badgesHtml.push('<span class="status-pill locked badge-locked">🔒 Zabezpieczony</span>');
-      if (art.is_featured) badgesHtml.push('<span class="status-pill featured badge-featured">⭐ Wyróżniony</span>');
-      if (!art.is_published) badgesHtml.push('<span class="status-pill draft badge-unpublished">⚠️ Szkic (Nieopublikowany)</span>');
+      if (art.is_locked) badgesHtml.push('<span class="status-pill badge-locked">🔒 Zabezpieczony</span>');
+      if (art.is_featured) badgesHtml.push('<span class="status-pill badge-featured">⭐ Wyróżniony</span>');
+      if (!art.is_published) badgesHtml.push('<span class="status-pill badge-unpublished">⚠️ Szkic (Nieopublikowany)</span>');
 
       const cats = parseCategories(art.categories);
+      const lastEditor = art.last_editor || art.editor || '';
 
       viewRoot.innerHTML = `
         <article class="wiki-article">
           <header class="wiki-article-header">
-            <div class="title-row" style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px;">
-              <div>
-                <h1 class="wiki-article-title">${escapeHtml(art.title)}</h1>
-                <div class="wiki-badges">${badgesHtml.join(' ')}</div>
-              </div>
-              <div class="article-header-actions">
-                <button type="button" class="btn btn-sm btn-outline btn-watch ${isWatching ? 'btn-watching' : ''}" id="article-watch-btn" title="${isWatching ? 'Przestań obserwować' : 'Dodaj do obserwowanych'}">
-                  ${isWatching ? '★ Obserwowane' : '☆ Obserwuj'}
-                </button>
-              </div>
+            <div class="title-row">
+              <h1 class="wiki-article-title">${escapeHtml(art.title)}</h1>
+              <div class="wiki-badges">${badgesHtml.join(' ')}</div>
             </div>
             <div class="wiki-article-meta">
               <span>👁️ Wyświetlenia: <strong>${art.views || 0}</strong></span>
               <span>🕒 Ostatnia modyfikacja: <strong>${formatDate(art.updated_at)}</strong></span>
-              ${art.editor ? `<span>✍️ Ostatni autor: <strong>${escapeHtml(art.editor)}</strong></span>` : ''}
+              ${lastEditor ? `<span>✍️ Autor ostatniej edycji: <strong>${escapeHtml(lastEditor)}</strong></span>` : ''}
             </div>
             ${art.summary ? `<p class="wiki-article-summary"><em>${escapeHtml(art.summary)}</em></p>` : ''}
           </header>
@@ -770,50 +890,19 @@
             </div>
           </div>
 
-          ${cats && cats.length > 0 ? `
-            <footer class="wiki-categories-bar" aria-label="Kategorie artykułu">
-              <span class="wiki-categories-label cat-label">Kategorie:</span>
-              ${cats.map(cName => `
-                <a href="#/categories/${encodeURIComponent(cName)}" class="wiki-category-tag">${escapeHtml(cName)}</a>
-              `).join(' ')}
+          ${cats.length > 0 ? `
+            <footer class="wiki-categories-bar">
+              <span class="cat-label">Kategorie:</span>
+              <ul class="cat-list">
+                ${cats.map(cName => `<li><a href="#/categories/${encodeURIComponent(cName)}">${escapeHtml(cName)}</a></li>`).join('')}
+              </ul>
             </footer>
           ` : ''}
         </article>
       `;
-
-      // Obsługa przycisku Obserwuj (Watchlist) - blokada przed podwójnym kliknięciem
-      const watchBtn = document.getElementById('article-watch-btn');
-      if (watchBtn) {
-        watchBtn.addEventListener('click', async () => {
-          if (!state.currentUser) {
-            showToast('Zaloguj się, aby dodać artykuł do obserwowanych', 'info');
-            openAuthModal('login');
-            return;
-          }
-
-          watchBtn.disabled = true;
-          try {
-            const res = await api(`/api/watchlist/${encodeURIComponent(slug)}/toggle`, {
-              method: 'POST'
-            });
-            const nowWatching = res.watching !== undefined ? res.watching : (res.isWatching !== undefined ? res.isWatching : !isWatching);
-            isWatching = nowWatching;
-            watchBtn.classList.toggle('btn-watching', nowWatching);
-            watchBtn.textContent = nowWatching ? '★ Obserwowane' : '☆ Obserwuj';
-            watchBtn.title = nowWatching ? 'Przestań obserwować' : 'Dodaj do obserwowanych';
-            showToast(nowWatching ? `Dodano „${art.title}” do obserwowanych` : `Usunięto „${art.title}” z obserwowanych`, 'success');
-          } catch (err) {
-            showToast(err.message, 'error');
-          } finally {
-            watchBtn.disabled = false;
-          }
-        });
-      }
-
     } catch (err) {
       updateArticleTabs(null);
       if (err.status === 404) {
-        setPageTitle('Strona nie znaleziona');
         viewRoot.innerHTML = `
           <div class="wiki-not-found">
             <h2>Strona nie została odnaleziona</h2>
@@ -827,156 +916,22 @@
           </div>
         `;
       } else {
-        setPageTitle('Błąd');
-        viewRoot.innerHTML = `
-          <div class="wiki-error">
-            <p>Błąd wczytywania artykułu: ${escapeHtml(err.message)}</p>
-            <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
-          </div>
-        `;
+        viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania artykułu: ${escapeHtml(err.message)}</div>`;
       }
     }
   }
 
-  // --- WIDOK 2b: Lista Obserwowanych (#/watchlist) ---
-  async function renderWatchlistView() {
-    updateArticleTabs(null);
-    setPageTitle('Obserwowane artykuły');
-    const viewRoot = document.getElementById('view-root');
-    viewRoot.classList.add('view-fade-in');
-
-    if (!state.currentUser) {
-      viewRoot.innerHTML = `
-        <div class="admin-auth-guard">
-          <h2>⭐ Lista obserwowanych haseł</h2>
-          <p>Aby zarządzać obserwowanymi artykułami i śledzić najnowsze zmiany, musisz się zalogować.</p>
-          <button type="button" id="watchlist-login-btn" class="btn btn-primary">Zaloguj się</button>
-        </div>
-      `;
-      document.getElementById('watchlist-login-btn')?.addEventListener('click', () => openAuthModal('login'));
-      return;
-    }
-
-    viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie listy obserwowanych artykułów...</div>';
-
-    try {
-      const [wlData, changesData] = await Promise.all([
-        api('/api/watchlist').catch(() => ({ watchlist: [] })),
-        api('/api/watchlist/changes').catch(() => ({ changes: [] }))
-      ]);
-
-      const watchlist = wlData.watchlist || wlData.articles || [];
-      const changes = changesData.changes || [];
-
-      viewRoot.innerHTML = `
-        <div class="watchlist-page">
-          <header class="watchlist-header" style="margin-bottom:20px;">
-            <h1>⭐ Obserwowane artykuły</h1>
-            <p>Śledź edycje i aktywność w wybranych przez Ciebie hasłach encyklopedii (${watchlist.length}).</p>
-          </header>
-
-          <div class="watchlist-layout" style="display:grid; grid-template-columns: 1fr 1fr; gap:24px; align-items:start;">
-            <!-- Kolumna 1: Zapisane artykuły -->
-            <section class="watchlist-articles-section">
-              <h2>Zapisane hasła (${watchlist.length})</h2>
-              ${watchlist.length === 0 ? `
-                <div class="catalog-empty" style="padding:20px;">
-                  <p>Nie obserwujesz jeszcze żadnych artykułów.</p>
-                  <p style="font-size:0.88rem; color:var(--wiki-text-muted);">Kliknij przycisk <strong>☆ Obserwuj</strong> na szczycie dowolnego artykułu, aby dodać go do tej listy.</p>
-                </div>
-              ` : `
-                <div class="watchlist-list" style="display:flex; flex-direction:column; gap:10px;">
-                  ${watchlist.map(art => {
-                    const slug = art.slug || art.article_slug;
-                    const title = art.title || slug;
-                    return `
-                      <div class="watchlist-item" style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; border:1px solid var(--wiki-border); border-radius:4px; background:var(--wiki-content-bg);">
-                        <div>
-                          <strong><a href="#/wiki/${encodeURIComponent(slug)}">${escapeHtml(title)}</a></strong>
-                          ${art.summary ? `<div style="font-size:0.83rem; color:var(--wiki-text-muted);">${escapeHtml(art.summary)}</div>` : ''}
-                        </div>
-                        <button type="button" class="btn btn-sm btn-outline unwatch-btn" data-slug="${encodeURIComponent(slug)}" title="Usuń z listy">
-                          ✕ Usuń
-                        </button>
-                      </div>
-                    `;
-                  }).join('')}
-                </div>
-              `}
-            </section>
-
-            <!-- Kolumna 2: Ostatnia aktywność w obserwowanych -->
-            <section class="watchlist-changes-section">
-              <h2>Ostatnie zmiany w obserwowanych (${changes.length})</h2>
-              ${changes.length === 0 ? `
-                <p style="color:var(--wiki-text-muted);">Brak ostatnich edycji w Twoich obserwowanych artykułach.</p>
-              ` : `
-                <div class="recent-changes-feed">
-                  ${changes.map(ch => {
-                    const slug = ch.slug || ch.article_slug;
-                    const title = ch.title || slug;
-                    return `
-                      <div class="recent-change-row">
-                        <div class="change-time">${formatDate(ch.created_at)}</div>
-                        <div class="change-main">
-                          <span class="change-art-title"><a href="#/wiki/${encodeURIComponent(slug)}">${escapeHtml(title)}</a></span>
-                          <span class="change-author">przez <strong>${escapeHtml(ch.editor || 'Anonim')}</strong></span>
-                          <div class="change-comment"><em>„${escapeHtml(ch.edit_comment || 'Aktualizacja treści')}”</em></div>
-                        </div>
-                        <div class="change-links">
-                          <a href="#/wiki/${encodeURIComponent(slug)}/history" class="btn btn-sm btn-outline">Historia</a>
-                        </div>
-                      </div>
-                    `;
-                  }).join('')}
-                </div>
-              `}
-            </section>
-          </div>
-        </div>
-      `;
-
-      // Handlery usuwania z listy z zabezpieczeniem disabled
-      document.querySelectorAll('.unwatch-btn').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const slug = btn.dataset.slug;
-          btn.disabled = true;
-          try {
-            await api(`/api/watchlist/${slug}/toggle`, { method: 'POST' });
-            showToast('Usunięto artykuł z obserwowanych', 'info');
-            renderWatchlistView();
-          } catch (err) {
-            btn.disabled = false;
-            showToast(err.message, 'error');
-          }
-        });
-      });
-
-    } catch (err) {
-      viewRoot.innerHTML = `
-        <div class="wiki-error">
-          <p>Błąd wczytywania listy obserwowanych: ${escapeHtml(err.message)}</p>
-          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
-        </div>
-      `;
-    }
-  }
-
-  // --- WIDOK 3 i 4: Edytor Artykułu (#/wiki/:slug/edit oraz #/new) z Split-Screen, Auto-save i Wykrywaniem Konfliktów ---
+  // --- WIDOK 3 i 4: Edytor Artykułu (#/wiki/:slug/edit oraz #/new) ---
   async function renderArticleEditor(slug = null, initialTitle = '') {
     const isNew = !slug;
-    const draftStorageKey = 'wiki_draft_' + (slug || 'new');
     const viewRoot = document.getElementById('view-root');
-    viewRoot.classList.add('view-fade-in');
 
-    // Sprawdzenie uprawnień edycji: tylko admin i editor
     if (!canEditWiki()) {
       updateArticleTabs(slug || null, 'read');
-      setPageTitle('Wymagane uprawnienia redaktora');
       viewRoot.innerHTML = `
         <div class="admin-auth-guard">
           <h2>🔒 Edycja dostępna dla redaktorów</h2>
-          <p>Tworzenie i edytowanie artykułów jest dostępne wyłącznie dla zalogowanych użytkowników z rolą <strong>redaktora</strong> lub <strong>administratora</strong>.</p>
+          <p>Tworzenie i edytowanie artykułów jest dostępne wyłącznie dla użytkowników z rolą <strong>redaktora</strong> lub <strong>administratora</strong>${String(state.settings.allow_anonymous_edits) === '1' ? ' (lub niezalogowanych, gdy edycje anonimowe są włączone)' : ''}.</p>
           ${state.currentUser
             ? '<p>Twoje konto nie posiada uprawnień do edycji haseł.</p>'
             : '<button type="button" id="editor-guard-login-btn" class="btn btn-primary">Zaloguj się</button>'}
@@ -992,7 +947,7 @@
       title: initialTitle,
       summary: '',
       content: '',
-      infobox: { title: '', items: {} },
+      infobox: null,
       categories: [],
       is_locked: 0,
       updated_at: null
@@ -1001,8 +956,13 @@
     if (!isNew) {
       try {
         const data = await api(`/api/articles/${encodeURIComponent(slug)}?noView=1`);
+        if (!data || !data.article) {
+          throw new Error('Nie znaleziono danych artykułu.');
+        }
         currentArticle = data.article;
-        setPageTitle(`Edycja: ${currentArticle.title}`);
+        if (currentArticle.slug && currentArticle.title) {
+          state.articleTitlesBySlug[currentArticle.slug] = currentArticle.title;
+        }
         updateArticleTabs(slug, 'edit', data.revisionsCount, data.talkCount);
       } catch (err) {
         showToast(err.message, 'error');
@@ -1010,359 +970,372 @@
         return;
       }
     } else {
-      setPageTitle(initialTitle ? `Nowy artykuł: ${initialTitle}` : 'Tworzenie nowego artykułu');
       updateArticleTabs(null);
     }
 
-    // Sprawdzenie obecności lokalnej kopii roboczej i ewentualnego konfliktu z wersją serwerową
-    let savedDraft = null;
-    let hasDraftConflict = false;
-    let isDraftNewer = false;
-
-    const rawDraft = safeGetStorage(draftStorageKey);
-    if (rawDraft) {
-      try {
-        const parsedDraft = JSON.parse(rawDraft);
-        if (parsedDraft && parsedDraft.content && (parsedDraft.content !== currentArticle.content || parsedDraft.title !== currentArticle.title)) {
-          savedDraft = parsedDraft;
-          const draftTime = Number(parsedDraft.savedAt || parsedDraft.timestamp || 0);
-          const serverTime = currentArticle.updated_at ? new Date(currentArticle.updated_at).getTime() : 0;
-
-          if (serverTime > 0 && draftTime > 0 && serverTime > draftTime) {
-            hasDraftConflict = true;
-          } else {
-            isDraftNewer = true;
-          }
+    // Dociągnij słownik tytułów artykułów w tle dla wyszukiwarki linków (Link Picker)
+    api('/api/articles?includeUnpublished=1', { suppressAuthExpiry: true })
+      .then(res => {
+        if (res && Array.isArray(res.articles)) {
+          res.articles.forEach(a => {
+            if (a && a.slug && a.title) state.articleTitlesBySlug[a.slug] = a.title;
+          });
         }
-      } catch {}
-    }
+      })
+      .catch(() => {});
 
     // Normalizacja infoboxu
-    let infoboxObj = { title: currentArticle.title || '', items: {} };
-    if (currentArticle.infobox) {
-      if (typeof currentArticle.infobox === 'string') {
-        try {
-          const parsed = JSON.parse(currentArticle.infobox);
-          if (parsed && typeof parsed === 'object') {
-            infoboxObj = parsed.items ? parsed : { title: currentArticle.title, items: parsed };
-          }
-        } catch {}
-      } else if (typeof currentArticle.infobox === 'object') {
-        infoboxObj = currentArticle.infobox.items ? currentArticle.infobox : { title: currentArticle.title, items: currentArticle.infobox };
-      }
-    }
+    const infoboxObj = normalizeInfobox(currentArticle.infobox);
 
-    // Normalizacja kategorii
-    const catsArr = parseCategories(currentArticle.categories);
-    const catString = catsArr.join(', ');
+    let selectedCategories = parseCategories(currentArticle.categories);
+    const isLockedAndNotAdmin = Boolean(!isNew && currentArticle.is_locked && (!state.currentUser || state.currentUser.role !== 'admin'));
+    const isAnonMode = !state.currentUser && String(state.settings.allow_anonymous_edits) === '1';
+    const draftKey = `wikikurekk_draft_${slug || 'new'}`;
+    let baseUpdatedAt = currentArticle.updated_at || null;
+    let editorMode = window.innerWidth > 960 ? 'split' : 'edit';
+    let scrollSyncEnabled = true;
+    let previewAbortController = null;
+    let previewRequestSeq = 0;
+    let previewDebounceTimer = null;
+    let autosaveTimer = null;
+    let activePopoverType = null;
 
-    // Ostrzeżenie o blokadzie artykułu
-    const isLockedAndNotAdmin = Boolean(currentArticle.is_locked && (!state.currentUser || state.currentUser.role !== 'admin'));
+    const editSummaryPresets = [
+      'Rozbudowa treści',
+      'Korekta stylu i literówek',
+      'Aktualizacja danych',
+      'Dodanie przypisów',
+      'Formatowanie i linki wewnętrzne'
+    ];
 
     viewRoot.innerHTML = `
       <div class="editor-container">
-        <!-- Alert konfliktu wersji lub przywracania wersji roboczej -->
-        ${hasDraftConflict ? `
-          <div id="draft-conflict-banner" class="alert alert-warning draft-conflict-warning" style="margin-bottom:16px;" role="alert">
-            <div class="draft-conflict-text">
-              ⚠️ <strong>Wykryto konflikt wersji:</strong> Artykuł został zmieniony na serwerze po utworzeniu Twojego lokalnego szkicu. Wybierz wersję roboczą lub wersję z serwera.
-              <div class="draft-conflict-meta" style="font-size:0.83rem; margin-top:3px; color:var(--wiki-text-muted);">
-                Lokalny szkic: ${formatDate(savedDraft.savedAt || savedDraft.timestamp)} &middot; Wersja serwera: ${formatDate(currentArticle.updated_at)}
-              </div>
-            </div>
-            <div class="draft-action-btns" style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
-              <button type="button" id="draft-use-local-btn" class="btn btn-sm btn-primary">Użyj lokalnego szkicu</button>
-              <button type="button" id="draft-use-server-btn" class="btn btn-sm btn-outline">Użyj wersji z serwera (odrzuć szkic)</button>
-            </div>
-          </div>
-        ` : (isDraftNewer ? `
-          <div id="draft-restore-banner" class="alert alert-info draft-restore-alert draft-alert" style="margin-bottom:16px;" role="alert">
-            <div class="draft-restore-text">
-              💾 <strong>Wersja robocza:</strong> Dostępna jest automatycznie zachowana kopia z dnia ${formatDate(savedDraft.savedAt || savedDraft.timestamp)}.
-            </div>
-            <div class="draft-action-btns" style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
-              <button type="button" id="draft-restore-btn" class="btn btn-sm btn-primary">Przywróć wersję roboczą</button>
-              <button type="button" id="draft-dismiss-btn" class="btn btn-sm btn-outline">Odrzuć</button>
-            </div>
-          </div>
-        ` : '')}
-
-        <!-- Górny zunifikowany panel sterowania (Header & Action Bar) -->
-        <header class="editor-header editor-card">
-          <div class="editor-header-main">
-            <div class="editor-title-group">
-              <div class="editor-title-row">
-                <h1>${isNew ? '➕ Tworzenie nowego artykułu' : `✏️ Edycja: ${escapeHtml(currentArticle.title)}`}</h1>
-                <span class="slug-preview-badge" id="editor-slug-preview">#/wiki/...</span>
-              </div>
-              <div class="editor-header-metrics">
-                <span class="word-counter-badge" id="editor-word-count">0 słów</span>
-                <span class="char-counter-badge" id="editor-char-count">0 znaków</span>
-                <span class="reading-time-badge" id="editor-reading-time">~0 min czytania</span>
-                <span class="editor-autosave-status" id="editor-autosave-indicator">💾 Szkic gotowy</span>
-              </div>
-            </div>
-
-            <!-- Przyciski akcji zawsze pod ręką w nagłówku -->
-            <div class="editor-header-actions">
-              <div class="editor-mode-bar" role="toolbar" aria-label="Wybierz układ edytora">
-                <button type="button" class="btn btn-sm editor-mode-btn active" data-mode="split" title="Edytor i podgląd na żywo obok siebie">Podzielony</button>
-                <button type="button" class="btn btn-sm editor-mode-btn" data-mode="editor" title="Tylko edytor">Tylko edytor</button>
-                <button type="button" class="btn btn-sm editor-mode-btn" data-mode="preview" title="Tylko podgląd">Tylko podgląd</button>
-              </div>
-              <button type="button" id="zen-toggle-btn" class="btn btn-sm btn-outline zen-toggle-btn toolbar-icon-btn" title="Tryb skupienia Zen (Alt+Z)" aria-label="Tryb Zen (Alt+Z)">
-                ⛶ Zen
-              </button>
-              <button type="button" id="editor-top-save-btn" class="btn btn-sm btn-primary" ${isLockedAndNotAdmin ? 'disabled title="Artykuł zabezpieczony"' : ''}>
-                💾 ${isNew ? 'Utwórz artykuł' : 'Zapisz'}
-              </button>
-            </div>
-          </div>
-
+        <header class="editor-header">
+          <h1>${isNew ? '➕ Tworzenie nowego artykułu' : `✏️ Edycja: ${escapeHtml(currentArticle.title)}`}</h1>
+          <p class="editor-lead">Formatuj treść w składni wikikodu (<code>== Nagłówek ==</code>, <code>'''pogrubienie'''</code>, <code>[[Link]]</code>, <code>&lt;ref&gt;źródło&lt;/ref&gt;</code>, tabele, ramki <code>:::note</code>).</p>
           ${isLockedAndNotAdmin ? `
-            <div class="alert alert-warning" role="alert" style="margin-top:12px;">
-              🔒 <strong>Artykuł zabezpieczony:</strong> Ten artykuł może edytować wyłącznie administrator. Pola edycyjne zostały zablokowane.
+            <div class="alert alert-warning" role="status">
+              🔒 <strong>Artykuł zabezpieczony:</strong> Ten artykuł jest chroniony i może go edytować wyłącznie administrator. Pola edycji zostały zablokowane (tryb podglądu źródła).
+            </div>
+          ` : ''}
+          ${isAnonMode ? `
+            <div class="alert alert-info" role="status">
+              ℹ️ <strong>Tryb edycji anonimowej:</strong> Wprowadzone zmiany zostaną zapisane jako edycja gościa (Anonim).
             </div>
           ` : ''}
         </header>
 
-        <!-- Kontener z układem Split-Screen -->
-        <div class="editor-split-container" id="editor-split-container">
-          <!-- Lewy panel: Formularz edytora -->
-          <div class="editor-split-pane" id="editor-left-pane">
-            <form id="article-editor-form" class="editor-form">
+        <div id="editor-draft-banner" class="editor-draft-banner hidden" role="region" aria-label="Odzyskiwanie szkicu"></div>
+        <div id="editor-conflict-banner" class="alert alert-danger hidden" role="alert"></div>
 
-              <!-- Karta 1: Tytuł i Główna Treść (Core Writing Workspace) -->
-              <div class="editor-card editor-main-card">
-                <div class="form-group editor-title-field">
-                  <label for="edit-title" class="editor-field-label">Tytuł hasła: <span class="required">*</span></label>
-                  <input type="text" id="edit-title" class="form-control editor-title-input" value="${escapeHtml(currentArticle.title || initialTitle)}" placeholder="Wpisz tytuł artykułu (np. Mikołaj Kopernik)..." required ${isLockedAndNotAdmin ? 'disabled' : ''} />
-                </div>
-
-                <!-- Przyklejony pasek narzędzi formatowania ze stylizowanymi ikonami SVG -->
-                <div class="editor-toolbar sticky-toolbar" role="toolbar" aria-label="Narzędzia formatowania">
-                  <div class="toolbar-btn-group">
-                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="heading" title="Nagłówek sekcji H2 (==)" aria-label="Nagłówek H2">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h8m-8-6v12m8-12v12m7 0h4m-4-6h2a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-2"/></svg>
-                      <span>H2</span>
-                    </button>
-                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="subheading" title="Podsekcja H3 (===)" aria-label="Podnagłówek H3">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h8m-8-6v12m8-12v12m6-6h3a2 2 0 0 1 0 4h-2m2 0a2 2 0 0 1 0 4h-3"/></svg>
-                      <span>H3</span>
-                    </button>
-                  </div>
-                  <div class="toolbar-divider" aria-hidden="true"></div>
-                  <div class="toolbar-btn-group">
-                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="bold" title="Pogrubienie ('''tekst''') (Ctrl+B)" aria-label="Pogrubienie">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/><path d="M6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/></svg>
-                      <span>B</span>
-                    </button>
-                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="italic" title="Kursywa (''tekst'') (Ctrl+I)" aria-label="Kursywa">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="19" y1="4" x2="10" y2="4"/><line x1="14" y1="20" x2="5" y2="20"/><line x1="15" y1="4" x2="9" y2="20"/></svg>
-                      <span>I</span>
-                    </button>
-                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="code" title="Kod inline (\`kod\`)" aria-label="Kod">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-                      <span>Kod</span>
-                    </button>
-                  </div>
-                  <div class="toolbar-divider" aria-hidden="true"></div>
-                  <div class="toolbar-btn-group">
-                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="link" title="Link wewnętrzny ([[...]])" aria-label="Link wewnętrzny">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-                      <span>Link</span>
-                    </button>
-                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="upload-image" title="Wgraj lub wstaw grafikę ([[Plik:...]])" aria-label="Wgraj grafikę">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-                      <span>Grafika</span>
-                    </button>
-                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="ref" title="Wstaw przypis (&lt;ref&gt;...&lt;/ref&gt;)" aria-label="Przypis">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-                      <span>Przypis</span>
-                    </button>
-                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="bullet" title="Lista punktowana (*)" aria-label="Lista">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
-                      <span>Lista</span>
-                    </button>
-                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="table" title="Wstaw tabelę wiki" aria-label="Tabela">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/></svg>
-                      <span>Tabela</span>
-                    </button>
-                  </div>
-                  <div class="toolbar-divider" aria-hidden="true"></div>
-                  <div class="toolbar-btn-group">
-                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="infobox-helper" title="Rozwiń i edytuj infobox" aria-label="Infobox">
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-                      <span>Infobox</span>
-                    </button>
-                  </div>
-                </div>
-
-                <div class="form-group" style="margin-bottom:0;">
-                  <label for="edit-content" class="sr-only">Treść artykułu (wikikod):</label>
-                  <textarea id="edit-content" class="editor-textarea form-control" rows="18" placeholder="Wpisz treść artykułu w wikikodzie..." ${isLockedAndNotAdmin ? 'disabled' : ''}>${escapeHtml(currentArticle.content || '')}</textarea>
-                </div>
-
-                <div class="editor-textarea-footer">
-                  <span class="editor-shortcut-hint">💡 Skróty: <strong>Ctrl+B</strong> pogrubienie, <strong>Ctrl+I</strong> kursywa, <strong>Ctrl+S</strong> zapis</span>
-                  <span class="editor-syntax-guide">Składnia: <code>== Nagłówek ==</code> &middot; <code>[[Link]]</code> &middot; <code>&lt;ref&gt;źródło&lt;/ref&gt;</code></span>
-                </div>
-              </div>
-
-              <!-- Karta 2: Ustawienia Hasła, Zajawka i Kategorie (Collapsible Accordion) -->
-              <details class="editor-card editor-collapsible-card" id="editor-meta-panel" open>
-                <summary class="editor-collapsible-summary">
-                  <span class="summary-left">
-                    <span class="summary-icon">⚙️</span>
-                    <strong class="summary-title">Ustawienia hasła: Zajawka i Kategorie</strong>
-                  </span>
-                  <span class="summary-badge" id="category-count-badge">${catsArr.length} kategorii</span>
-                </summary>
-
-                <div class="editor-collapsible-content">
-                  <div class="form-group">
-                    <label for="edit-summary" class="editor-field-label">Krótkie podsumowanie (zajawka artykułu):</label>
-                    <input type="text" id="edit-summary" class="form-control" value="${escapeHtml(currentArticle.summary || '')}" placeholder="Np. 'Polski astronom i twórca teorii heliocentrycznej.'" ${isLockedAndNotAdmin ? 'disabled' : ''} />
-                    <small class="form-text-muted">Jedno lub dwa zdania streszczające temat hasła, wyświetlane w podglądzie katalogu.</small>
-                  </div>
-
-                  <div class="form-group" style="margin-bottom:0;">
-                    <label for="category-chip-input" class="editor-field-label">Kategorie artykułu:</label>
-                    <div class="category-chips-container">
-                      <div id="category-chips-list" class="category-chips-list"></div>
-                      <div class="category-chip-input-wrap">
-                        <input type="text" id="category-chip-input" class="form-control category-chip-input" placeholder="Wpisz kategorię i naciśnij Enter..." ${isLockedAndNotAdmin ? 'disabled' : ''} />
-                      </div>
-                      <input type="hidden" id="edit-categories" value="${escapeHtml(catString)}" />
-                    </div>
-
-                    <div class="category-suggestions">
-                      <span class="category-suggestions-title">Szybkie dodawanie:</span>
-                      <div class="category-suggestions-list" id="category-suggestions-list">
-                        ${(state.categories && state.categories.length > 0
-                            ? state.categories.map(c => typeof c === 'object' ? c.name : c)
-                            : ['Nauka', 'Historia', 'Polska', 'Technologia', 'Geografia', 'Biografie']
-                          ).slice(0, 8).map(cat => `
-                            <button type="button" class="category-suggestion-pill" data-category="${escapeHtml(cat)}">+ ${escapeHtml(cat)}</button>
-                        `).join('')}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </details>
-
-              <!-- Karta 3: Infobox (Tabela boczna) z szablonami (Collapsible Accordion) -->
-              <details class="editor-card editor-collapsible-card infobox-collapsible-card" id="editor-infobox-panel" ${Object.keys(items).length > 0 ? 'open' : ''}>
-                <summary class="editor-collapsible-summary">
-                  <span class="summary-left">
-                    <span class="summary-icon">ℹ️</span>
-                    <strong class="summary-title">Infobox (tabela boczna artykułu)</strong>
-                  </span>
-                  <span class="summary-badge" id="infobox-count-badge">${Object.keys(items).length > 0 ? `${Object.keys(items).length} pól` : 'Opcjonalny (kliknij aby rozwinąć)'}</span>
-                </summary>
-
-                <div class="editor-collapsible-content">
-                  <fieldset class="infobox-editor-fieldset" ${isLockedAndNotAdmin ? 'disabled' : ''}>
-                    <legend class="sr-only">ℹ️ Infobox (tabela boczna)</legend>
-
-                    <div class="infobox-templates-section">
-                      <div class="infobox-templates-label">
-                        📋 Wstaw gotowy szablon pól (bezpieczne scalanie danych):
-                      </div>
-                      <div class="infobox-templates-grid">
-                        <button type="button" class="btn btn-sm btn-outline infobox-template-btn" data-template="biography">👤 Biografia</button>
-                        <button type="button" class="btn btn-sm btn-outline infobox-template-btn" data-template="geography">🌍 Geografia</button>
-                        <button type="button" class="btn btn-sm btn-outline infobox-template-btn" data-template="science">🔬 Nauka / Pojęcie</button>
-                        <button type="button" class="btn btn-sm btn-outline infobox-template-btn" data-template="organization">🏛️ Organizacja</button>
-                      </div>
-                    </div>
-
-                    <div class="infobox-main-params-grid">
-                      <div class="form-group">
-                        <label for="infobox-title" class="editor-field-label">Tytuł infoboksu:</label>
-                        <input type="text" id="infobox-title" class="form-control" value="${escapeHtml(infoboxObj.title || currentArticle.title || '')}" placeholder="Domyślnie tytuł artykułu" />
-                      </div>
-                      <div class="form-group">
-                        <label for="infobox-image" class="editor-field-label">Adres URL grafiki (opcjonalny):</label>
-                        <input type="url" id="infobox-image" class="form-control" value="${escapeHtml(infoboxObj.image || '')}" placeholder="https://... lub /uploads/..." />
-                      </div>
-                    </div>
-
-                    <div class="infobox-rows-header">
-                      <span class="infobox-rows-label">Własne parametry (Etykieta &rarr; Wartość):</span>
-                      <button type="button" id="infobox-add-row-btn" class="btn btn-sm btn-outline">+ Dodaj kolejne pole</button>
-                    </div>
-
-                    <div id="infobox-rows-container" class="infobox-editor-grid"></div>
-                  </fieldset>
-                </div>
-              </details>
-
-              <!-- Karta 4: Publikacja i Komentarz Rewizji -->
-              <div class="editor-card editor-publish-card">
-                <div class="form-group" style="margin-bottom:12px;">
-                  <label for="edit-comment" class="editor-field-label">Opis zmian (komentarz do wersji):</label>
-                  <input type="text" id="edit-comment" class="form-control" placeholder="Np. 'Utworzenie hasła', 'Korekta literówki', 'Rozszerzenie sekcji'" value="${isNew ? 'Utworzenie artykułu' : ''}" ${isLockedAndNotAdmin ? 'disabled' : ''} />
-                </div>
-
-                <div class="editor-actions">
-                  <button type="submit" id="editor-save-btn" class="btn btn-primary btn-save-main" ${isLockedAndNotAdmin ? 'disabled title="Artykuł zablokowany"' : ''}>
-                    💾 ${isNew ? 'Utwórz artykuł' : 'Zapisz zmiany'}
-                  </button>
-                  <a href="${isNew ? '#/' : `#/wiki/${encodeURIComponent(slug)}`}" class="btn btn-outline">Anuluj</a>
-                </div>
-              </div>
-
-            </form>
-          </div>
-
-          <!-- Prawy panel: Podgląd na żywo Split-Screen -->
-          <div class="editor-preview-pane wiki-article-body-wrapper" id="editor-live-preview-pane">
-            <div class="preview-pane-header">
-              <div class="preview-header-left">
-                <strong>👁️ Podgląd na żywo</strong>
-                <span class="preview-live-badge">Live Sync</span>
-              </div>
-              <small id="preview-status">Aktualny</small>
+        <form id="article-editor-form" class="editor-form">
+          <div class="editor-meta-grid">
+            <div class="form-group">
+              <label for="edit-title">Tytuł hasła:</label>
+              <input type="text" id="edit-title" class="form-control" value="${escapeHtml(currentArticle.title)}" placeholder="Np. Komputer kwantowy" required ${isLockedAndNotAdmin ? 'disabled' : ''} />
+              ${isNew ? '<div id="editor-slug-preview" class="editor-slug-preview"></div>' : ''}
             </div>
-            <div id="live-preview-content" class="live-preview-content"></div>
+
+            <div class="form-group">
+              <label for="edit-summary">Krótkie podsumowanie (zajawka):</label>
+              <input type="text" id="edit-summary" class="form-control" value="${escapeHtml(currentArticle.summary || '')}" placeholder="Jednozdaniowe podsumowanie artykułu" ${isLockedAndNotAdmin ? 'disabled' : ''} />
+            </div>
           </div>
-        </div>
+
+          <div class="form-group">
+            <label for="edit-category-input">Kategorie:</label>
+            <div id="category-picker" class="category-picker">
+              <div id="category-chips" class="category-chips"></div>
+              <input type="text" id="edit-category-input" class="form-control category-picker-input" placeholder="Wpisz nazwę kategorii i naciśnij Enter (lub kliknij podpowiedź)" ${isLockedAndNotAdmin ? 'disabled' : ''} />
+              <div id="category-suggestions" class="category-suggestions"></div>
+            </div>
+          </div>
+
+          <div class="editor-mode-bar">
+            <div id="editor-mode-tabs" class="editor-mode-tabs" role="tablist" aria-label="Tryb edytora">
+              <button type="button" class="editor-mode-btn ${editorMode === 'edit' ? 'active' : ''}" data-mode="edit" role="tab" aria-selected="${editorMode === 'edit'}">Edycja</button>
+              <button type="button" class="editor-mode-btn ${editorMode === 'split' ? 'active' : ''}" data-mode="split" role="tab" aria-selected="${editorMode === 'split'}">Podział 50/50</button>
+              <button type="button" class="editor-mode-btn ${editorMode === 'preview' ? 'active' : ''}" data-mode="preview" role="tab" aria-selected="${editorMode === 'preview'}">Podgląd</button>
+            </div>
+            <div class="editor-mode-tools">
+              <button type="button" id="editor-scroll-sync-btn" class="editor-sync-btn is-active" aria-pressed="true" title="Synchronizuj przewijanie edytora i podglądu">⇅ Sync przewijania</button>
+              <span id="editor-dirty-badge" class="editor-dirty-badge is-clean">Bez zmian</span>
+              <span id="editor-autosave-status" class="editor-autosave-status">Szkic lokalny gotowy</span>
+            </div>
+          </div>
+
+          <!-- Pasek narzędzi formatowania i popovery -->
+          <div class="editor-toolbar-wrap">
+            <div class="editor-toolbar" role="toolbar" aria-label="Narzędzia formatowania wikikodu">
+              <div class="toolbar-group">
+                <button type="button" class="toolbar-btn" data-action="heading" title="Nagłówek sekcji (== ==)" ${isLockedAndNotAdmin ? 'disabled' : ''}><strong>H2</strong></button>
+                <button type="button" class="toolbar-btn" data-action="subheading" title="Podnagłówek (=== ===)" ${isLockedAndNotAdmin ? 'disabled' : ''}><strong>H3</strong></button>
+              </div>
+              <span class="toolbar-sep" aria-hidden="true"></span>
+              <div class="toolbar-group">
+                <button type="button" class="toolbar-btn" data-action="bold" title="Pogrubienie (Ctrl+B)" ${isLockedAndNotAdmin ? 'disabled' : ''}><strong>B</strong></button>
+                <button type="button" class="toolbar-btn" data-action="italic" title="Kursywa (Ctrl+I)" ${isLockedAndNotAdmin ? 'disabled' : ''}><em>I</em></button>
+                <button type="button" class="toolbar-btn" data-action="bold-italic" title="Pogrubienie i kursywa (''''')" ${isLockedAndNotAdmin ? 'disabled' : ''}><strong><em>BI</em></strong></button>
+                <button type="button" class="toolbar-btn" data-action="strike" title="Przekreślenie (~~ ~~)" ${isLockedAndNotAdmin ? 'disabled' : ''}><s>S</s></button>
+                <button type="button" class="toolbar-btn" data-action="code" title="Kod w linii (\`kod\`)" ${isLockedAndNotAdmin ? 'disabled' : ''}><code>&lt;/&gt;</code></button>
+              </div>
+              <span class="toolbar-sep" aria-hidden="true"></span>
+              <div class="toolbar-group">
+                <button type="button" class="toolbar-btn" data-action="bullet" title="Lista punktowana (*)" ${isLockedAndNotAdmin ? 'disabled' : ''}>• Lista</button>
+                <button type="button" class="toolbar-btn" data-action="ordered" title="Lista numerowana (1.)" ${isLockedAndNotAdmin ? 'disabled' : ''}>1. Lista</button>
+                <button type="button" class="toolbar-btn" data-action="quote" title="Cytat blokowy (>)" ${isLockedAndNotAdmin ? 'disabled' : ''}>❝ Cytat</button>
+                <button type="button" class="toolbar-btn" data-action="codeblock" title="Blok kodu (\`\`\`)" ${isLockedAndNotAdmin ? 'disabled' : ''}>&#96;&#96;&#96; Kod</button>
+                <button type="button" class="toolbar-btn" data-action="hr" title="Linia pozioma (----)" ${isLockedAndNotAdmin ? 'disabled' : ''}>― Linia</button>
+              </div>
+              <span class="toolbar-sep" aria-hidden="true"></span>
+              <div class="toolbar-group">
+                <button type="button" class="toolbar-btn" data-action="link" title="Wstaw link wewnętrzny lub zewnętrzny (Ctrl+K)" ${isLockedAndNotAdmin ? 'disabled' : ''}>🔗 Link</button>
+                <button type="button" class="toolbar-btn" data-action="ref" title="Wstaw przypis (<ref>)" ${isLockedAndNotAdmin ? 'disabled' : ''}>📑 Przypis</button>
+                <button type="button" class="toolbar-btn" data-action="table" title="Generator tabeli wiki" ${isLockedAndNotAdmin ? 'disabled' : ''}>📊 Tabela</button>
+                <button type="button" class="toolbar-btn" data-action="image" title="Wstaw ilustrację / obraz" ${isLockedAndNotAdmin ? 'disabled' : ''}>🖼️ Obraz</button>
+                <button type="button" class="toolbar-btn" data-action="callout" title="Wstaw ramkę informacyjną (:::note)" ${isLockedAndNotAdmin ? 'disabled' : ''}>💡 Ramka</button>
+                <button type="button" class="toolbar-btn" data-action="infobox-helper" title="Dodaj pole do infoboxu" ${isLockedAndNotAdmin ? 'disabled' : ''}>ℹ️ +Infobox</button>
+              </div>
+            </div>
+            <div id="editor-popover-host" class="editor-popover hidden" role="dialog" aria-label="Pomocnik wstawiania"></div>
+          </div>
+
+          <!-- Obszar roboczy: Źródło + Podgląd na żywo -->
+          <div id="editor-workspace" class="editor-workspace mode-${editorMode}">
+            <div class="editor-pane-source">
+              <textarea id="edit-content" aria-label="Treść artykułu (wikikod)" class="editor-textarea form-control" rows="18" placeholder="Wpisz treść artykułu w składni wikikodu..." ${isLockedAndNotAdmin ? 'disabled' : ''}>${escapeHtml(currentArticle.content || '')}</textarea>
+              <div id="editor-status-bar" class="editor-status-bar"></div>
+            </div>
+
+            <div id="preview-wrapper" class="editor-pane-preview">
+              <div class="preview-pane-header">
+                <span>👁️ Podgląd na żywo</span>
+                <span id="preview-meta-stats" class="preview-meta-stats"></span>
+              </div>
+              <div id="preview-box" class="preview-box wiki-article-body-wrapper"></div>
+            </div>
+          </div>
+
+          <!-- Sekcja edytora infoboxu -->
+          <fieldset class="infobox-editor-fieldset">
+            <legend>ℹ️ Infobox (tabela boczna artykułu)</legend>
+            <div class="editor-meta-grid">
+              <div class="form-group">
+                <label for="infobox-title">Tytuł infoboxu (opcjonalny):</label>
+                <input type="text" id="infobox-title" class="form-control" value="${escapeHtml(infoboxObj.title || '')}" placeholder="Domyślnie tytuł artykułu" ${isLockedAndNotAdmin ? 'disabled' : ''} />
+              </div>
+              <div class="form-group">
+                <label for="infobox-image">Adres URL obrazka (http://, https:// lub /...):</label>
+                <input type="text" id="infobox-image" class="form-control" value="${escapeHtml(infoboxObj.image || '')}" placeholder="https://..." ${isLockedAndNotAdmin ? 'disabled' : ''} />
+                <div id="infobox-image-error" class="form-error hidden"></div>
+              </div>
+            </div>
+            <div class="infobox-rows-label">Wiersze klucz – wartość:</div>
+            <div id="infobox-rows-container" class="infobox-editor-grid"></div>
+            <button type="button" id="infobox-add-row-btn" class="btn btn-sm btn-outline" ${isLockedAndNotAdmin ? 'disabled' : ''}>+ Dodaj pole infoboxu</button>
+          </fieldset>
+
+          <div class="form-group">
+            <label for="edit-comment">Opis zmian (komentarz do historii wersji):</label>
+            <input type="text" id="edit-comment" class="form-control" placeholder="Np. Rozbudowa sekcji historycznej, korekta literówki" value="${isNew ? 'Utworzenie artykułu' : ''}" ${isLockedAndNotAdmin ? 'disabled' : ''} />
+            <div class="edit-summary-presets" aria-label="Szybkie podpowiedzi opisu zmian">
+              ${editSummaryPresets.map(preset => `
+                <button type="button" class="summary-chip-btn" data-summary="${escapeHtml(preset)}" ${isLockedAndNotAdmin ? 'disabled' : ''}>${escapeHtml(preset)}</button>
+              `).join('')}
+            </div>
+          </div>
+
+          <div class="editor-actions">
+            <button type="submit" id="editor-save-btn" class="btn btn-primary" ${isLockedAndNotAdmin ? 'disabled' : ''}>💾 ${isNew ? 'Utwórz artykuł' : 'Zapisz zmiany'}</button>
+            <a href="${isNew ? '#/' : `#/wiki/${encodeURIComponent(slug)}`}" id="editor-cancel-link" class="btn btn-outline">Anuluj</a>
+          </div>
+        </form>
       </div>
     `;
 
-    // Obsługa wierszy infoboxu
+    // Referencje DOM
+    const formEl = document.getElementById('article-editor-form');
+    const titleInput = document.getElementById('edit-title');
+    const summaryInput = document.getElementById('edit-summary');
+    const textarea = document.getElementById('edit-content');
+    const commentInput = document.getElementById('edit-comment');
+    const infoboxTitleInput = document.getElementById('infobox-title');
+    const infoboxImageInput = document.getElementById('infobox-image');
+    const infoboxImageErrorEl = document.getElementById('infobox-image-error');
     const infoboxContainer = document.getElementById('infobox-rows-container');
-    const items = infoboxObj.items || {};
+    const categoryInput = document.getElementById('edit-category-input');
+    const categoryChipsEl = document.getElementById('category-chips');
+    const categorySuggestionsEl = document.getElementById('category-suggestions');
+    const workspaceEl = document.getElementById('editor-workspace');
+    const previewWrapper = document.getElementById('preview-wrapper');
+    const previewBox = document.getElementById('preview-box');
+    const previewMetaStatsEl = document.getElementById('preview-meta-stats');
+    const statusBarEl = document.getElementById('editor-status-bar');
+    const dirtyBadgeEl = document.getElementById('editor-dirty-badge');
+    const autosaveStatusEl = document.getElementById('editor-autosave-status');
+    const draftBannerEl = document.getElementById('editor-draft-banner');
+    const conflictBannerEl = document.getElementById('editor-conflict-banner');
+    const popoverHost = document.getElementById('editor-popover-host');
+    const slugPreviewEl = document.getElementById('editor-slug-preview');
+    const scrollSyncBtn = document.getElementById('editor-scroll-sync-btn');
 
-    function updateInfoboxBadge() {
-      const badge = document.getElementById('infobox-count-badge');
-      if (!badge) return;
-      const validRows = Array.from(infoboxContainer.querySelectorAll('.infobox-row-item')).filter(row => {
-        return Boolean(row.querySelector('.info-key')?.value.trim() || row.querySelector('.info-val')?.value.trim());
-      });
-      badge.textContent = validRows.length > 0 ? `${validRows.length} pól` : 'Opcjonalny (kliknij aby rozwinąć)';
+    // --- Pomocniki formularza (kategorie, infobox, slug, stan brudny) ---
+    function updateSlugPreview() {
+      if (!slugPreviewEl) return;
+      const val = titleInput.value.trim();
+      const s = slugifyTitle(val);
+      if (!val) {
+        slugPreviewEl.innerHTML = 'Adres artykułu: <code>#/wiki/...</code>';
+        slugPreviewEl.classList.remove('is-invalid');
+      } else if (!s) {
+        slugPreviewEl.innerHTML = '<span class="editor-slug-warning">⚠️ Tytuł nie zawiera liter ani cyfr pozwalających utworzyć adres URL (slug).</span>';
+        slugPreviewEl.classList.add('is-invalid');
+      } else {
+        const exists = (state.allSlugs || []).includes(s);
+        slugPreviewEl.innerHTML = `Adres artykułu: <code>#/wiki/${escapeHtml(s)}</code>${exists ? ' <span class="editor-slug-warning">(taki artykuł już istnieje)</span>' : ''}`;
+        slugPreviewEl.classList.toggle('is-invalid', exists);
+      }
     }
 
-    function addInfoboxRow(key = '', val = '') {
+    function renderCategoryPicker() {
+      categoryChipsEl.innerHTML = selectedCategories.map((cat, idx) => `
+        <span class="category-chip-tag">
+          <span>${escapeHtml(cat)}</span>
+          ${isLockedAndNotAdmin ? '' : `<button type="button" class="category-chip-remove" data-index="${idx}" aria-label="Usuń kategorię ${escapeHtml(cat)}">&times;</button>`}
+        </span>
+      `).join('');
+
+      categoryChipsEl.querySelectorAll('.category-chip-remove').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const idx = Number(btn.dataset.index);
+          selectedCategories.splice(idx, 1);
+          renderCategoryPicker();
+          onEditorDataChanged();
+        });
+      });
+
+      const filterText = categoryInput.value.trim().toLocaleLowerCase('pl');
+      const selectedLower = new Set(selectedCategories.map(c => c.toLocaleLowerCase('pl')));
+      const suggestions = (state.categories || [])
+        .map(c => getCatName(c))
+        .filter(name => name && !selectedLower.has(name.toLocaleLowerCase('pl')))
+        .filter(name => !filterText || name.toLocaleLowerCase('pl').includes(filterText))
+        .slice(0, 10);
+
+      if (suggestions.length === 0 || isLockedAndNotAdmin) {
+        categorySuggestionsEl.innerHTML = '';
+        categorySuggestionsEl.classList.add('hidden');
+      } else {
+        categorySuggestionsEl.classList.remove('hidden');
+        categorySuggestionsEl.innerHTML = `
+          <span class="category-suggestions-label">Podpowiedzi:</span>
+          ${suggestions.map(name => `
+            <button type="button" class="category-suggestion-btn" data-cat="${escapeHtml(name)}">+ ${escapeHtml(name)}</button>
+          `).join('')}
+        `;
+        categorySuggestionsEl.querySelectorAll('.category-suggestion-btn').forEach(btn => {
+          btn.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+          });
+          btn.addEventListener('click', () => {
+            addCategoryChip(btn.dataset.cat);
+          });
+        });
+      }
+    }
+
+    function addCategoryChip(rawName) {
+      const clean = String(rawName || '').trim();
+      if (!clean) return;
+      const exists = selectedCategories.some(c => c.toLocaleLowerCase('pl') === clean.toLocaleLowerCase('pl'));
+      if (!exists) {
+        selectedCategories.push(clean);
+      }
+      categoryInput.value = '';
+      renderCategoryPicker();
+      onEditorDataChanged();
+    }
+
+    categoryInput.addEventListener('input', () => renderCategoryPicker());
+    categoryInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ',') {
+        e.preventDefault();
+        const raw = categoryInput.value.replace(/,/g, '').trim();
+        if (raw) addCategoryChip(raw);
+      } else if (e.key === 'Backspace' && !categoryInput.value && selectedCategories.length > 0) {
+        selectedCategories.pop();
+        renderCategoryPicker();
+        onEditorDataChanged();
+      }
+    });
+    categoryInput.addEventListener('blur', () => {
+      const raw = categoryInput.value.replace(/,/g, '').trim();
+      if (raw) addCategoryChip(raw);
+    });
+
+    function getEffectiveCategories() {
+      const pending = categoryInput.value.replace(/,/g, '').trim();
+      if (!pending) return [...selectedCategories];
+      const exists = selectedCategories.some(c => c.toLocaleLowerCase('pl') === pending.toLocaleLowerCase('pl'));
+      return exists ? [...selectedCategories] : [...selectedCategories, pending];
+    }
+
+    // --- Wiersze infoboxu z przesuwaniem i walidacją ---
+    function refreshInfoboxRowButtons() {
+      const rows = Array.from(infoboxContainer.querySelectorAll('.infobox-row-item'));
+      rows.forEach((row, idx) => {
+        const upBtn = row.querySelector('.info-up');
+        const downBtn = row.querySelector('.info-down');
+        if (upBtn) upBtn.disabled = isLockedAndNotAdmin || idx === 0;
+        if (downBtn) downBtn.disabled = isLockedAndNotAdmin || idx === rows.length - 1;
+      });
+    }
+
+    function addInfoboxRow(key = '', val = '', focusKey = false) {
       const row = document.createElement('div');
       row.className = 'infobox-row-item';
       row.innerHTML = `
         <input type="text" class="form-control info-key" placeholder="Etykieta (np. Stolica)" value="${escapeHtml(key)}" ${isLockedAndNotAdmin ? 'disabled' : ''} />
         <input type="text" class="form-control info-val" placeholder="Wartość (np. Warszawa)" value="${escapeHtml(val)}" ${isLockedAndNotAdmin ? 'disabled' : ''} />
-        <button type="button" class="btn btn-danger btn-sm info-del" title="Usuń pole" ${isLockedAndNotAdmin ? 'disabled' : ''}>&times;</button>
+        <div class="infobox-row-actions">
+          <button type="button" class="btn btn-outline btn-sm info-up" title="Przesuń w górę" aria-label="Przesuń wiersz w górę">&uarr;</button>
+          <button type="button" class="btn btn-outline btn-sm info-down" title="Przesuń w dół" aria-label="Przesuń wiersz w dół">&darr;</button>
+          <button type="button" class="btn btn-danger btn-sm info-del" title="Usuń wiersz" aria-label="Usuń wiersz" ${isLockedAndNotAdmin ? 'disabled' : ''}>&times;</button>
+        </div>
       `;
+
+      row.querySelector('.info-key').addEventListener('input', onEditorDataChanged);
+      row.querySelector('.info-val').addEventListener('input', onEditorDataChanged);
+      row.querySelector('.info-up').addEventListener('click', () => {
+        const prev = row.previousElementSibling;
+        if (prev) {
+          infoboxContainer.insertBefore(row, prev);
+          refreshInfoboxRowButtons();
+          onEditorDataChanged();
+        }
+      });
+      row.querySelector('.info-down').addEventListener('click', () => {
+        const next = row.nextElementSibling;
+        if (next) {
+          infoboxContainer.insertBefore(next, row);
+          refreshInfoboxRowButtons();
+          onEditorDataChanged();
+        }
+      });
       row.querySelector('.info-del').addEventListener('click', () => {
         row.remove();
-        updateInfoboxBadge();
-        triggerLivePreview();
-        triggerAutoSave();
+        refreshInfoboxRowButtons();
+        onEditorDataChanged();
       });
+
       infoboxContainer.appendChild(row);
-      updateInfoboxBadge();
+      refreshInfoboxRowButtons();
+      if (focusKey) {
+        row.querySelector('.info-key')?.focus();
+      }
     }
 
-    const existingEntries = Object.entries(items);
+    const existingEntries = Object.entries(infoboxObj.items || {});
     if (existingEntries.length > 0) {
       existingEntries.forEach(([k, v]) => addInfoboxRow(k, v));
     } else {
@@ -1370,593 +1343,1300 @@
     }
 
     document.getElementById('infobox-add-row-btn').addEventListener('click', () => {
-      addInfoboxRow('', '');
-      triggerLivePreview();
-      triggerAutoSave();
+      addInfoboxRow('', '', true);
     });
 
-    // Szablony infoboxu z bezpiecznym scalaniem (safe merge)
-    const infoboxTemplates = {
-      biography: {
-        name: 'Biografia',
-        fields: ['Imię i nazwisko', 'Data urodzenia', 'Miejsce urodzenia', 'Zawód', 'Narodowość']
-      },
-      geography: {
-        name: 'Geografia',
-        fields: ['Państwo', 'Stolica', 'Powierzchnia', 'Liczba ludności', 'Język urzędowy']
-      },
-      science: {
-        name: 'Nauka / Pojęcie',
-        fields: ['Dziedzina', 'Twórca / Odkrywca', 'Rok odkrycia', 'Zastosowanie', 'Status']
-      },
-      organization: {
-        name: 'Organizacja',
-        fields: ['Typ organizacji', 'Siedziba', 'Data założenia', 'Założyciel', 'Liczba członków']
+    function validateInfoboxImageField() {
+      const raw = infoboxImageInput.value.trim();
+      if (!raw || isSafeUrl(raw)) {
+        infoboxImageErrorEl.textContent = '';
+        infoboxImageErrorEl.classList.add('hidden');
+        return true;
       }
-    };
+      infoboxImageErrorEl.textContent = 'Dozwolone są wyłącznie adresy http://, https:// lub ścieżki względne zaczynające się od /.';
+      infoboxImageErrorEl.classList.remove('hidden');
+      return false;
+    }
 
-    function applyInfoboxTemplate(tplKey) {
-      const tpl = infoboxTemplates[tplKey];
-      if (!tpl) return;
+    function collectInfoboxData({ strict = false } = {}) {
+      const title = infoboxTitleInput.value.trim();
+      const imageRaw = infoboxImageInput.value.trim();
 
-      const infoboxPanel = document.getElementById('editor-infobox-panel');
-      if (infoboxPanel) infoboxPanel.open = true;
-
-      const existingKeys = new Set();
-      infoboxContainer.querySelectorAll('.infobox-row-item').forEach(row => {
-        const k = row.querySelector('.info-key')?.value.trim();
-        if (k) existingKeys.add(k.toLowerCase());
-      });
-
-      let addedCount = 0;
-      tpl.fields.forEach(field => {
-        if (!existingKeys.has(field.toLowerCase())) {
-          const emptyRow = Array.from(infoboxContainer.querySelectorAll('.infobox-row-item')).find(row => {
-            return !row.querySelector('.info-key')?.value.trim() && !row.querySelector('.info-val')?.value.trim();
-          });
-          if (emptyRow) {
-            emptyRow.querySelector('.info-key').value = field;
-          } else {
-            addInfoboxRow(field, '');
-          }
-          existingKeys.add(field.toLowerCase());
-          addedCount++;
+      if (imageRaw && !isSafeUrl(imageRaw)) {
+        if (strict) {
+          showToast('Nieprawidłowy adres URL obrazka infoboxu. Użyj http://, https:// lub /.', 'warning');
+          infoboxImageInput.focus();
+          return { error: true };
         }
-      });
-
-      updateInfoboxBadge();
-
-      if (addedCount > 0) {
-        showToast(`Dodano ${addedCount} nowych pól z szablonu "${tpl.name}".`, 'info');
-        triggerLivePreview();
-        triggerAutoSave();
-      } else {
-        showToast(`Wszystkie pola z szablonu "${tpl.name}" już znajdują się w infoboxie.`, 'info');
-      }
-    }
-
-    document.querySelectorAll('.infobox-template-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        applyInfoboxTemplate(btn.dataset.template);
-      });
-    });
-
-    // Obsługa chipów kategorii
-    let currentCategories = parseCategories(currentArticle.categories);
-
-    function renderCategoryChips() {
-      const listEl = document.getElementById('category-chips-list');
-      if (!listEl) return;
-      listEl.innerHTML = currentCategories.map((cat, idx) => `
-        <span class="category-chip" data-category="${escapeHtml(cat)}">
-          ${escapeHtml(cat)}
-          <button type="button" class="category-chip-remove" data-index="${idx}" title="Usuń kategorię ${escapeHtml(cat)}" aria-label="Usuń kategorię ${escapeHtml(cat)}">&times;</button>
-        </span>
-      `).join('');
-
-      const hiddenInput = document.getElementById('edit-categories');
-      if (hiddenInput) {
-        hiddenInput.value = currentCategories.join(', ');
       }
 
-      const catCountBadge = document.getElementById('category-count-badge');
-      if (catCountBadge) {
-        catCountBadge.textContent = `${currentCategories.length} kategorii`;
-      }
-
-      document.querySelectorAll('.category-suggestion-pill').forEach(pill => {
-        const catName = pill.dataset.category;
-        if (currentCategories.some(c => c.toLowerCase() === catName.toLowerCase())) {
-          pill.classList.add('selected');
-        } else {
-          pill.classList.remove('selected');
-        }
-      });
-
-      listEl.querySelectorAll('.category-chip-remove').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          const idx = Number(btn.dataset.index);
-          removeCategory(idx);
-        });
-      });
-    }
-
-    function addCategory(name) {
-      const clean = name.trim().replace(/^,+|,+$/g, '');
-      if (!clean) return;
-      if (!currentCategories.some(c => c.toLowerCase() === clean.toLowerCase())) {
-        currentCategories.push(clean);
-        renderCategoryChips();
-        triggerLivePreview();
-        triggerAutoSave();
-      }
-    }
-
-    function removeCategory(index) {
-      if (index >= 0 && index < currentCategories.length) {
-        currentCategories.splice(index, 1);
-        renderCategoryChips();
-        triggerLivePreview();
-        triggerAutoSave();
-      }
-    }
-
-    const catInput = document.getElementById('category-chip-input');
-    if (catInput) {
-      catInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ',') {
-          e.preventDefault();
-          const val = catInput.value;
-          if (val) {
-            val.split(',').forEach(part => addCategory(part));
-            catInput.value = '';
-          }
-        }
-      });
-      catInput.addEventListener('blur', () => {
-        const val = catInput.value;
-        if (val) {
-          val.split(',').forEach(part => addCategory(part));
-          catInput.value = '';
-        }
-      });
-    }
-
-    document.querySelectorAll('.category-suggestion-pill').forEach(pill => {
-      pill.addEventListener('click', (e) => {
-        e.preventDefault();
-        const cat = pill.dataset.category;
-        if (cat) addCategory(cat);
-      });
-    });
-
-    renderCategoryChips();
-
-    // Pasek narzędzi
-    const textarea = document.getElementById('edit-content');
-    const fileUploadInput = document.getElementById('editor-file-upload');
-
-    function insertAroundSelection(before, after = '') {
-      const start = textarea.selectionStart;
-      const end = textarea.selectionEnd;
-      const selText = textarea.value.substring(start, end);
-      const replacement = before + (selText || 'tekst') + after;
-      textarea.value = textarea.value.substring(0, start) + replacement + textarea.value.substring(end);
-      textarea.focus();
-      textarea.selectionStart = start + before.length;
-      textarea.selectionEnd = textarea.selectionStart + (selText.length || 5);
-      triggerLivePreview();
-      triggerAutoSave();
-      updateEditorMetrics();
-    }
-
-    // Liczniki słów, znaków i czasu czytania
-    function updateEditorMetrics() {
-      const content = textarea ? textarea.value : '';
-      const chars = content.length;
-      const words = content.trim() ? content.trim().split(/\s+/).length : 0;
-      const readingMinutes = words > 0 ? Math.ceil(words / 200) : 0;
-
-      const wordBadge = document.getElementById('editor-word-count');
-      const charBadge = document.getElementById('editor-char-count');
-      const readBadge = document.getElementById('editor-reading-time');
-
-      if (wordBadge) wordBadge.textContent = `${words} słów`;
-      if (charBadge) charBadge.textContent = `${chars} znaków`;
-      if (readBadge) readBadge.textContent = `~${readingMinutes} min czytania`;
-    }
-
-    // Podgląd wygenerowanego sluga w czasie rzeczywistym
-    function updateSlugPreview() {
-      const titleInput = document.getElementById('edit-title');
-      const previewEl = document.getElementById('editor-slug-preview');
-      if (!previewEl) return;
-      const val = titleInput ? titleInput.value.trim() : '';
-      const s = slugify(val);
-      previewEl.textContent = s ? `#/wiki/${s}` : '#/wiki/...';
-    }
-
-    // Zbieranie danych infoboxu
-    function collectInfoboxData() {
-      const title = document.getElementById('infobox-title').value.trim();
-      const image = sanitizeImageUrl(document.getElementById('infobox-image').value.trim());
+      const image = imageRaw && isSafeUrl(imageRaw) ? imageRaw : '';
       const collectedItems = {};
-      infoboxContainer.querySelectorAll('.infobox-row-item').forEach(row => {
-        const k = row.querySelector('.info-key').value.trim();
-        const v = row.querySelector('.info-val').value.trim();
+      const rows = infoboxContainer.querySelectorAll('.infobox-row-item');
+
+      for (const row of rows) {
+        const keyInput = row.querySelector('.info-key');
+        const valInput = row.querySelector('.info-val');
+        const k = keyInput.value.trim();
+        const v = valInput.value.trim();
+
+        if ((k && !v) || (!k && v)) {
+          if (strict) {
+            showToast('Uzupełnij zarówno etykietę, jak i wartość wiersza infoboxu (lub usuń pusty wiersz).', 'warning');
+            (k ? valInput : keyInput).focus();
+            return { error: true };
+          }
+          continue;
+        }
         if (k && v) {
           collectedItems[k] = v;
         }
-      });
-      if (!title && !image && Object.keys(collectedItems).length === 0) {
+      }
+
+      if (!image && Object.keys(collectedItems).length === 0) {
         return null;
       }
+
       return {
-        title: title || document.getElementById('edit-title').value.trim(),
+        title: title || titleInput.value.trim(),
         image: image || undefined,
         items: collectedItems
       };
     }
 
-    // Podgląd na żywo z debouncingiem (150ms)
-    let livePreviewTimer = null;
-    let livePreviewReqId = 0;
-
-    function triggerLivePreview() {
-      if (livePreviewTimer) clearTimeout(livePreviewTimer);
-      const previewStatus = document.getElementById('preview-status');
-      if (previewStatus) previewStatus.textContent = 'Renderowanie...';
-
-      const currentReq = ++livePreviewReqId;
-      livePreviewTimer = setTimeout(async () => {
-        const content = textarea.value;
-        const title = document.getElementById('edit-title').value.trim() || 'Podgląd';
-        const previewContent = document.getElementById('live-preview-content');
-        if (!previewContent) return;
-
-        try {
-          const res = await api('/api/preview', {
-            method: 'POST',
-            body: { content, title }
-          });
-          if (currentReq !== livePreviewReqId) return;
-
-          const currentInfobox = collectInfoboxData();
-          previewContent.innerHTML = `
-            ${renderInfobox(currentInfobox, title)}
-            ${renderToc(res.toc)}
-            <div class="wiki-article-body">${res.renderedHtml || '<p><em>Pusta treść</em></p>'}</div>
-          `;
-          if (previewStatus) previewStatus.textContent = 'Zaktualizowano';
-        } catch {
-          if (currentReq === livePreviewReqId && previewStatus) {
-            previewStatus.textContent = 'Błąd podglądu';
-          }
-        }
-      }, 150);
-    }
-
-    // Automatyczny zapis kopii roboczej (Auto-save) w ustrukturyzowanej postaci
-    let autoSaveTimer = null;
-    function triggerAutoSave() {
-      const indicator = document.getElementById('editor-autosave-indicator');
-      if (indicator) indicator.textContent = '💾 Zapisywanie szkicu...';
-      if (autoSaveTimer) clearTimeout(autoSaveTimer);
-      autoSaveTimer = setTimeout(() => {
-        const draftData = {
-          title: document.getElementById('edit-title')?.value || '',
-          summary: document.getElementById('edit-summary')?.value || '',
-          content: textarea?.value || '',
-          infobox: collectInfoboxData(),
-          categories: document.getElementById('edit-categories')?.value || '',
-          savedAt: Date.now()
-        };
-        safeSetStorage(draftStorageKey, JSON.stringify(draftData));
-        if (indicator) indicator.textContent = '✓ Zapisano w szkicu';
-      }, 1500);
-    }
-
-    // Obsługa akcji w przypadku wykrytego konfliktu wersji
-    if (hasDraftConflict) {
-      document.getElementById('draft-use-local-btn')?.addEventListener('click', () => {
-        if (savedDraft.title && document.getElementById('edit-title')) {
-          document.getElementById('edit-title').value = savedDraft.title;
-        }
-        if (savedDraft.summary && document.getElementById('edit-summary')) {
-          document.getElementById('edit-summary').value = savedDraft.summary;
-        }
-        if (savedDraft.content && textarea) {
-          textarea.value = savedDraft.content;
-        }
-        if (savedDraft.categories && document.getElementById('edit-categories')) {
-          document.getElementById('edit-categories').value = savedDraft.categories;
-          currentCategories = parseCategories(savedDraft.categories);
-          renderCategoryChips();
-        }
-        document.getElementById('draft-conflict-banner')?.remove();
-        showToast('Zastosowano lokalny szkic.', 'info');
-        triggerLivePreview();
-        updateEditorMetrics();
-        updateSlugPreview();
-      });
-
-      document.getElementById('draft-use-server-btn')?.addEventListener('click', () => {
-        safeRemoveStorage(draftStorageKey);
-        document.getElementById('draft-conflict-banner')?.remove();
-        showToast('Zachowano wersję z serwera, szkic usunięty.', 'info');
-      });
-    } else if (isDraftNewer) {
-      document.getElementById('draft-restore-btn')?.addEventListener('click', () => {
-        if (savedDraft.title && document.getElementById('edit-title')) {
-          document.getElementById('edit-title').value = savedDraft.title;
-        }
-        if (savedDraft.summary && document.getElementById('edit-summary')) {
-          document.getElementById('edit-summary').value = savedDraft.summary;
-        }
-        if (savedDraft.content && textarea) {
-          textarea.value = savedDraft.content;
-        }
-        if (savedDraft.categories && document.getElementById('edit-categories')) {
-          document.getElementById('edit-categories').value = savedDraft.categories;
-          currentCategories = parseCategories(savedDraft.categories);
-          renderCategoryChips();
-        }
-        document.getElementById('draft-restore-banner')?.remove();
-        showToast('Kopia robocza została przywrócona!', 'info');
-        triggerLivePreview();
-        updateEditorMetrics();
-        updateSlugPreview();
-      });
-
-      document.getElementById('draft-dismiss-btn')?.addEventListener('click', () => {
-        safeRemoveStorage(draftStorageKey);
-        document.getElementById('draft-restore-banner')?.remove();
-      });
-    }
-
-    // Wgrywanie grafiki na serwer przez przycisk narzędziowy
-    if (fileUploadInput) {
-      fileUploadInput.onchange = async () => {
-        const file = fileUploadInput.files && fileUploadInput.files[0];
-        if (!file) return;
-
-        if (file.size > 5 * 1024 * 1024) {
-          showToast('Rozmiar pliku przekracza dopuszczalny limit 5MB', 'warning');
-          fileUploadInput.value = '';
-          return;
-        }
-
-        const formData = new FormData();
-        formData.append('file', file);
-
-        showToast(`Wgrywanie pliku: ${file.name}...`, 'info');
-        try {
-          const res = await api('/api/upload', {
-            method: 'POST',
-            body: formData
-          });
-          const uploadedName = res.filename || (res.file && res.file.filename) || file.name;
-          insertAroundSelection(`[[Plik:${uploadedName}|miniaturka|prawo|Opis grafiki]]\n`, '');
-          showToast(`Grafika ${uploadedName} została wgrana!`, 'success');
-        } catch (err) {
-          showToast(`Błąd wgrywania: ${err.message}`, 'error');
-        } finally {
-          fileUploadInput.value = '';
-        }
+    function getSnapshot() {
+      return {
+        title: titleInput.value,
+        summary: summaryInput.value,
+        content: textarea.value,
+        categories: getEffectiveCategories(),
+        infobox: collectInfoboxData()
       };
     }
+
+    const initialSnapshotJson = JSON.stringify(getSnapshot());
+
+    function isEditorDirty() {
+      if (isLockedAndNotAdmin) return false;
+      return JSON.stringify(getSnapshot()) !== initialSnapshotJson;
+    }
+
+    function updateDirtyBadge() {
+      const dirty = isEditorDirty();
+      if (dirtyBadgeEl) {
+        dirtyBadgeEl.textContent = dirty ? '● Niezapisane zmiany' : 'Bez zmian';
+        dirtyBadgeEl.classList.toggle('is-dirty', dirty);
+        dirtyBadgeEl.classList.toggle('is-clean', !dirty);
+      }
+    }
+
+    // --- Pasek statusu edytora ---
+    function updateEditorStatusBar() {
+      if (!statusBarEl) return;
+      const val = textarea.value;
+      const trimmed = val.trim();
+      const words = trimmed ? trimmed.split(/\s+/).length : 0;
+      const chars = val.length;
+      const readMin = words === 0 ? '0 min' : `~${Math.max(1, Math.ceil(words / 200))} min`;
+
+      const pos = textarea.selectionStart || 0;
+      const upToCursor = val.slice(0, pos);
+      const line = upToCursor.split('\n').length;
+      const col = pos - upToCursor.lastIndexOf('\n');
+
+      statusBarEl.innerHTML = `
+        <span>Słowa: <strong>${words}</strong></span>
+        <span class="status-sep">&middot;</span>
+        <span>Znaki: <strong>${chars}</strong></span>
+        <span class="status-sep">&middot;</span>
+        <span>Czas czytania: <strong>${readMin}</strong></span>
+        <span class="status-sep">&middot;</span>
+        <span>Wiersz <strong>${line}</strong>, kol. <strong>${col}</strong></span>
+      `;
+    }
+
+    // --- Podgląd na żywo i tryby edytora ---
+    function setEditorMode(mode) {
+      if (!['edit', 'split', 'preview'].includes(mode)) return;
+      editorMode = mode;
+      workspaceEl.classList.remove('mode-edit', 'mode-split', 'mode-preview');
+      workspaceEl.classList.add(`mode-${mode}`);
+
+      document.querySelectorAll('#editor-mode-tabs .editor-mode-btn').forEach(btn => {
+        const active = btn.dataset.mode === mode;
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-selected', active ? 'true' : 'false');
+      });
+
+      if (scrollSyncBtn) {
+        scrollSyncBtn.classList.toggle('hidden', mode !== 'split');
+      }
+
+      if (mode === 'split' || mode === 'preview') {
+        scheduleLivePreview(true);
+      }
+    }
+
+    document.querySelectorAll('#editor-mode-tabs .editor-mode-btn').forEach(btn => {
+      btn.addEventListener('click', () => setEditorMode(btn.dataset.mode));
+    });
+
+    if (scrollSyncBtn) {
+      scrollSyncBtn.classList.toggle('hidden', editorMode !== 'split');
+      scrollSyncBtn.addEventListener('click', () => {
+        scrollSyncEnabled = !scrollSyncEnabled;
+        scrollSyncBtn.classList.toggle('is-active', scrollSyncEnabled);
+        scrollSyncBtn.setAttribute('aria-pressed', scrollSyncEnabled ? 'true' : 'false');
+      });
+    }
+
+    async function runLivePreview() {
+      if (editorMode === 'edit') return;
+
+      const seq = ++previewRequestSeq;
+      if (previewAbortController) previewAbortController.abort();
+      previewAbortController = new AbortController();
+
+      const title = titleInput.value.trim();
+      const summary = summaryInput.value.trim();
+      const content = textarea.value;
+      const categories = getEffectiveCategories();
+      const infobox = collectInfoboxData();
+
+      try {
+        const res = await api('/api/preview', {
+          method: 'POST',
+          body: { title, summary, content, infobox, categories },
+          signal: previewAbortController.signal,
+          suppressAuthExpiry: true
+        });
+        if (seq !== previewRequestSeq || !document.contains(previewBox)) return;
+
+        const safeInfobox = res.infobox !== undefined ? res.infobox : infobox;
+        const bodyHtml = res.renderedHtml && res.renderedHtml.trim()
+          ? res.renderedHtml
+          : '<p class="preview-empty-hint"><em>Zacznij pisać treść artykułu, aby zobaczyć podgląd na żywo...</em></p>';
+
+        previewBox.innerHTML = `
+          <header class="wiki-article-header preview-article-header">
+            <h1 class="wiki-article-title">${escapeHtml(title || 'Bez tytułu')}</h1>
+            ${summary ? `<p class="wiki-article-summary"><em>${escapeHtml(summary)}</em></p>` : ''}
+          </header>
+          <div class="wiki-article-body-wrapper">
+            ${renderInfobox(safeInfobox, title)}
+            ${renderToc(res.toc)}
+            <div class="wiki-article-body">${bodyHtml}</div>
+          </div>
+          ${categories.length > 0 ? `
+            <footer class="wiki-categories-bar">
+              <span class="cat-label">Kategorie:</span>
+              <ul class="cat-list">
+                ${categories.map(c => `<li><a href="#/categories/${encodeURIComponent(c)}">${escapeHtml(c)}</a></li>`).join('')}
+              </ul>
+            </footer>
+          ` : ''}
+        `;
+
+        if (previewMetaStatsEl) {
+          if (typeof res.wordCount === 'number') {
+            previewMetaStatsEl.textContent = `${res.wordCount} słów · ~${res.readingTimeMinutes || 1} min`;
+          } else {
+            previewMetaStatsEl.textContent = '';
+          }
+        }
+      } catch (err) {
+        if (err.name === 'AbortError' || !document.contains(previewBox)) return;
+        previewBox.innerHTML = `<div class="wiki-error">Błąd podglądu: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    function scheduleLivePreview(immediate = false) {
+      if (previewDebounceTimer) clearTimeout(previewDebounceTimer);
+      if (editorMode === 'edit') return;
+      if (immediate) {
+        runLivePreview();
+      } else {
+        previewDebounceTimer = setTimeout(runLivePreview, 250);
+      }
+    }
+
+    // Proporcjonalna synchronizacja przewijania w trybie podziału
+    let isSyncingScroll = false;
+    function getScrollablePreviewTarget() {
+      if (previewBox.scrollHeight > previewBox.clientHeight + 4) return previewBox;
+      if (previewWrapper.scrollHeight > previewWrapper.clientHeight + 4) return previewWrapper;
+      return previewBox;
+    }
+
+    function syncScroll(fromEl, toEl) {
+      if (!scrollSyncEnabled || editorMode !== 'split' || isSyncingScroll) return;
+      const maxFrom = fromEl.scrollHeight - fromEl.clientHeight;
+      const maxTo = toEl.scrollHeight - toEl.clientHeight;
+      if (maxFrom <= 0 || maxTo <= 0) return;
+      isSyncingScroll = true;
+      const ratio = fromEl.scrollTop / maxFrom;
+      toEl.scrollTop = ratio * maxTo;
+      requestAnimationFrame(() => {
+        isSyncingScroll = false;
+      });
+    }
+
+    textarea.addEventListener('scroll', () => {
+      syncScroll(textarea, getScrollablePreviewTarget());
+    });
+    previewBox.addEventListener('scroll', () => {
+      if (getScrollablePreviewTarget() === previewBox) syncScroll(previewBox, textarea);
+    });
+    previewWrapper.addEventListener('scroll', () => {
+      if (getScrollablePreviewTarget() === previewWrapper) syncScroll(previewWrapper, textarea);
+    });
+
+    // Przechwytywanie kliknięć wewnątrz podglądu, aby nie stracić edycji
+    previewBox.addEventListener('click', (e) => {
+      const tocToggle = e.target.closest('.wiki-toc-toggle');
+      if (tocToggle) {
+        e.preventDefault();
+        e.stopPropagation();
+        const tocNav = tocToggle.closest('.wiki-toc');
+        const list = tocNav?.querySelector('.toc-list');
+        if (tocNav && list) {
+          const collapsed = list.classList.toggle('hidden');
+          tocNav.classList.toggle('is-collapsed', collapsed);
+          tocToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+          tocToggle.textContent = collapsed ? 'Pokaż' : 'Ukryj';
+        }
+        return;
+      }
+
+      const anchorLink = e.target.closest('a[href^="#sekcja-"], a[href^="#ref-"], a[href^="#cite_"]');
+      if (anchorLink) {
+        e.preventDefault();
+        e.stopPropagation();
+        const targetId = anchorLink.getAttribute('href').slice(1);
+        const el = previewBox.querySelector(`[id="${targetId.replace(/"/g, '\\"')}"]`);
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        return;
+      }
+
+      const link = e.target.closest('a');
+      if (!link) return;
+      if (link.classList.contains('wiki-link-external')) {
+        return; // target="_blank" otwiera w nowej karcie
+      }
+
+      e.preventDefault();
+      e.stopPropagation();
+      if (link.classList.contains('wiki-link-red') || link.hasAttribute('data-missing-title')) {
+        const missingTitle = link.dataset.missingTitle || link.textContent.trim();
+        showToast(`Podgląd: brakujący artykuł „${missingTitle}” (nawigacja wyłączona w edytorze).`, 'info');
+      } else {
+        const targetText = link.textContent.trim();
+        showToast(`Podgląd: link do „${targetText}” (zapisz zmiany przed przejściem).`, 'info');
+      }
+    });
+
+    // --- Autozapis i przywracanie szkicu z localStorage ---
+    function saveLocalDraft() {
+      if (isLockedAndNotAdmin) return;
+      if (!isEditorDirty()) return;
+      try {
+        const payload = {
+          title: titleInput.value,
+          summary: summaryInput.value,
+          content: textarea.value,
+          categories: getEffectiveCategories(),
+          infobox: collectInfoboxData(),
+          edit_comment: commentInput.value,
+          savedAt: new Date().toISOString()
+        };
+        localStorage.setItem(draftKey, JSON.stringify(payload));
+        if (autosaveStatusEl) {
+          const t = new Date().toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          autosaveStatusEl.textContent = `Szkic zapisany lokalnie (${t})`;
+        }
+      } catch (_) {}
+    }
+
+    function clearLocalDraft() {
+      try {
+        localStorage.removeItem(draftKey);
+      } catch (_) {}
+    }
+
+    function checkExistingDraft() {
+      if (isLockedAndNotAdmin) return;
+      try {
+        const raw = localStorage.getItem(draftKey);
+        if (!raw) return;
+        const draft = JSON.parse(raw);
+        if (!draft || typeof draft !== 'object') return;
+        const draftSnap = JSON.stringify({
+          title: draft.title || '',
+          summary: draft.summary || '',
+          content: draft.content || '',
+          categories: Array.isArray(draft.categories) ? draft.categories : [],
+          infobox: draft.infobox || null
+        });
+        if (draftSnap === initialSnapshotJson) return;
+        if (!String(draft.title || '').trim() && !String(draft.content || '').trim()) return;
+
+        const savedAtText = formatDate(draft.savedAt);
+        draftBannerEl.classList.remove('hidden');
+        draftBannerEl.innerHTML = `
+          <div class="draft-banner-text">
+            📝 <strong>Znaleziono zapisany szkic lokalny</strong>${savedAtText ? ` (${escapeHtml(savedAtText)})` : ''}. Czy chcesz go przywrócić?
+          </div>
+          <div class="editor-draft-actions">
+            <button type="button" id="restore-draft-btn" class="btn btn-sm btn-primary">Przywróć szkic</button>
+            <button type="button" id="discard-draft-btn" class="btn btn-sm btn-outline">Odrzuć</button>
+          </div>
+        `;
+
+        document.getElementById('restore-draft-btn')?.addEventListener('click', () => {
+          titleInput.value = draft.title || '';
+          summaryInput.value = draft.summary || '';
+          textarea.value = draft.content || '';
+          if (draft.edit_comment !== undefined) commentInput.value = draft.edit_comment || '';
+          selectedCategories = parseCategories(draft.categories);
+          categoryInput.value = '';
+          renderCategoryPicker();
+
+          // Przywrócenie infoboxu
+          infoboxContainer.innerHTML = '';
+          const restoredInfobox = normalizeInfobox(draft.infobox);
+          infoboxTitleInput.value = restoredInfobox.title;
+          infoboxImageInput.value = restoredInfobox.image;
+          const entries = Object.entries(restoredInfobox.items);
+          if (entries.length > 0) {
+            entries.forEach(([k, v]) => addInfoboxRow(k, v));
+          } else {
+            addInfoboxRow('', '');
+          }
+
+          draftBannerEl.classList.add('hidden');
+          updateSlugPreview();
+          validateInfoboxImageField();
+          updateEditorStatusBar();
+          updateToolbarActiveStates();
+          updateDirtyBadge();
+          scheduleLivePreview(true);
+          showToast('Przywrócono lokalny szkic artykułu.', 'success');
+        });
+
+        document.getElementById('discard-draft-btn')?.addEventListener('click', () => {
+          clearLocalDraft();
+          draftBannerEl.classList.add('hidden');
+          showToast('Odrzucono zapisany szkic.', 'info');
+        });
+      } catch (_) {}
+    }
+
+    function onEditorDataChanged() {
+      updateSlugPreview();
+      validateInfoboxImageField();
+      updateDirtyBadge();
+      updateEditorStatusBar();
+      updateToolbarActiveStates();
+      scheduleLivePreview(false);
+
+      if (autosaveTimer) clearTimeout(autosaveTimer);
+      autosaveTimer = setTimeout(saveLocalDraft, 800);
+    }
+
+    // --- Silnik zaznaczania i wstawiania z zachowaniem natywnego Ctrl+Z oraz scrollTop ---
+    function replaceTextareaRange(start, end, replacement, selectStartOffset = null, selectEndOffset = null) {
+      if (isLockedAndNotAdmin) return;
+      const prevScrollTop = textarea.scrollTop;
+      const prevScrollLeft = textarea.scrollLeft;
+
+      textarea.focus({ preventScroll: true });
+      textarea.setSelectionRange(start, end);
+
+      let execOk = false;
+      try {
+        execOk = document.execCommand('insertText', false, replacement);
+      } catch {
+        execOk = false;
+      }
+
+      if (!execOk) {
+        textarea.setRangeText(replacement, start, end, 'end');
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+
+      const offStart = selectStartOffset !== null ? selectStartOffset : replacement.length;
+      const offEnd = selectEndOffset !== null ? selectEndOffset : offStart;
+      textarea.setSelectionRange(start + offStart, start + offEnd);
+      textarea.scrollTop = prevScrollTop;
+      textarea.scrollLeft = prevScrollLeft;
+
+      onEditorDataChanged();
+    }
+
+    function countCharRunBackward(str, pos, ch) {
+      let count = 0;
+      for (let i = pos - 1; i >= 0 && str[i] === ch; i--) count++;
+      return count;
+    }
+
+    function countCharRunForward(str, pos, ch) {
+      let count = 0;
+      for (let i = pos; i < str.length && str[i] === ch; i++) count++;
+      return count;
+    }
+
+    function isWrappedByApostrophes(val, start, end, len) {
+      const leftCount = countCharRunBackward(val, start, "'");
+      const rightCount = countCharRunForward(val, end, "'");
+      if (len === 2) {
+        return (leftCount === 2 && rightCount === 2) || (leftCount >= 5 && rightCount >= 5);
+      }
+      if (len === 3) {
+        return (leftCount === 3 && rightCount === 3) || (leftCount >= 5 && rightCount >= 5);
+      }
+      if (len === 5) {
+        return leftCount >= 5 && rightCount >= 5;
+      }
+      return false;
+    }
+
+    function toggleInlineWrap(markerStart, markerEnd, placeholder) {
+      const val = textarea.value;
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      const sel = val.slice(start, end);
+      const lenS = markerStart.length;
+      const lenE = markerEnd.length;
+
+      // 1. Zaznaczenie samo zawiera znaczniki (np. '''tekst''')
+      if (sel.length >= lenS + lenE && sel.startsWith(markerStart) && sel.endsWith(markerEnd)) {
+        const inner = sel.slice(lenS, sel.length - lenE);
+        replaceTextareaRange(start, end, inner, 0, inner.length);
+        return;
+      }
+
+      // 2. Zaznaczenie otoczone przez znaczniki bezpośrednio na zewnątrz
+      const isApostropheMarker = markerStart === "''" || markerStart === "'''" || markerStart === "'''''";
+      const wrappedOutside = isApostropheMarker
+        ? isWrappedByApostrophes(val, start, end, lenS)
+        : (val.slice(start - lenS, start) === markerStart && val.slice(end, end + lenE) === markerEnd);
+
+      if (wrappedOutside) {
+        replaceTextareaRange(start - lenS, end + lenE, sel, 0, sel.length);
+        return;
+      }
+
+      // 3. Brak zaznaczenia lub nowe owinięcie
+      if (start !== end) {
+        const replacement = markerStart + sel + markerEnd;
+        replaceTextareaRange(start, end, replacement, lenS, lenS + sel.length);
+      } else {
+        const replacement = markerStart + placeholder + markerEnd;
+        replaceTextareaRange(start, end, replacement, lenS, lenS + placeholder.length);
+      }
+    }
+
+    function getSelectedLineBounds() {
+      const val = textarea.value;
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      const lineStart = val.lastIndexOf('\n', start - 1) + 1;
+      const effectiveEnd = (end > start && val[end - 1] === '\n') ? end - 1 : end;
+      const nextNl = val.indexOf('\n', effectiveEnd);
+      const lineEnd = nextNl === -1 ? val.length : nextNl;
+      return { lineStart, lineEnd, blockText: val.slice(lineStart, lineEnd) };
+    }
+
+    function toggleHeading(level) {
+      const eq = level === 3 ? '===' : '==';
+      const defaultTitle = level === 3 ? 'Podsekcja' : 'Nagłówek sekcji';
+      const { lineStart, lineEnd, blockText } = getSelectedLineBounds();
+      const firstLine = blockText.split('\n')[0];
+      const match = firstLine.match(/^(={2,6})\s*(.*?)\s*\1$/);
+
+      if (match) {
+        const currentEq = match[1];
+        const cleanTitle = match[2].trim();
+        if (currentEq === eq) {
+          // Przełącz wyłączenie nagłówka
+          replaceTextareaRange(lineStart, lineStart + firstLine.length, cleanTitle, 0, cleanTitle.length);
+        } else {
+          // Zmień poziom nagłówka
+          const nextText = `${eq} ${cleanTitle} ${eq}`;
+          replaceTextareaRange(lineStart, lineStart + firstLine.length, nextText, eq.length + 1, eq.length + 1 + cleanTitle.length);
+        }
+        return;
+      }
+
+      const trimmed = firstLine.trim();
+      if (!trimmed) {
+        const nextText = `${eq} ${defaultTitle} ${eq}`;
+        replaceTextareaRange(lineStart, lineStart + firstLine.length, nextText, eq.length + 1, eq.length + 1 + defaultTitle.length);
+      } else {
+        const nextText = `${eq} ${trimmed} ${eq}`;
+        replaceTextareaRange(lineStart, lineStart + firstLine.length, nextText, eq.length + 1, eq.length + 1 + trimmed.length);
+      }
+    }
+
+    function toggleLinePrefix(mode) {
+      const { lineStart, lineEnd, blockText } = getSelectedLineBounds();
+      const lines = blockText.split('\n');
+      const nonEmptyLines = lines.filter(l => l.trim().length > 0);
+
+      if (nonEmptyLines.length === 0) {
+        if (mode === 'bullet') {
+          replaceTextareaRange(lineStart, lineEnd, '* Element listy', 2, 15);
+        } else if (mode === 'ordered') {
+          replaceTextareaRange(lineStart, lineEnd, '1. Element listy', 3, 16);
+        } else if (mode === 'quote') {
+          replaceTextareaRange(lineStart, lineEnd, '> Cytat', 2, 7);
+        }
+        return;
+      }
+
+      const testRegex = mode === 'bullet'
+        ? /^\*\s+/
+        : mode === 'ordered'
+          ? /^\d+\.\s+/
+          : /^>\s?/;
+
+      const allHavePrefix = nonEmptyLines.every(l => testRegex.test(l.trimStart()));
+      let counter = 1;
+      const transformed = lines.map(line => {
+        if (!line.trim()) return line;
+        if (allHavePrefix) {
+          return line.replace(/^(\s*)(?:\*\s+|\d+\.\s+|>\s?)/, '$1');
+        }
+        const stripped = line.replace(/^(\s*)(?:[\*\-]\s+|\d+\.\s+|>\s?)/, '$1');
+        const indent = stripped.match(/^\s*/)[0];
+        const body = stripped.slice(indent.length);
+        if (mode === 'bullet') return `${indent}* ${body}`;
+        if (mode === 'ordered') return `${indent}${counter++}. ${body}`;
+        return `${indent}> ${body}`;
+      });
+
+      const nextBlock = transformed.join('\n');
+      replaceTextareaRange(lineStart, lineEnd, nextBlock, 0, nextBlock.length);
+    }
+
+    function insertCodeBlock() {
+      const { lineStart, lineEnd, blockText } = getSelectedLineBounds();
+      const trimmed = blockText.trim();
+      if (!trimmed) {
+        const snippet = '```\nkod\n```';
+        replaceTextareaRange(lineStart, lineEnd, snippet, 4, 7);
+      } else if (/^```[\s\S]*```$/.test(trimmed)) {
+        const unwrapped = trimmed.replace(/^```[^\n]*\n?/, '').replace(/\n?```$/, '');
+        replaceTextareaRange(lineStart, lineEnd, unwrapped, 0, unwrapped.length);
+      } else {
+        const wrapped = '```\n' + blockText + '\n```';
+        replaceTextareaRange(lineStart, lineEnd, wrapped, 4, 4 + blockText.length);
+      }
+    }
+
+    function insertHorizontalRule() {
+      const { lineStart, lineEnd, blockText } = getSelectedLineBounds();
+      const val = textarea.value;
+      if (!blockText.trim()) {
+        const suffix = lineEnd === val.length ? '\n' : '';
+        replaceTextareaRange(lineStart, lineEnd, '----' + suffix, 4 + suffix.length, 4 + suffix.length);
+      } else {
+        const insertStr = '\n\n----\n';
+        replaceTextareaRange(lineEnd, lineEnd, insertStr, insertStr.length, insertStr.length);
+      }
+    }
+
+    function indentSelectedLines(outdent = false) {
+      const val = textarea.value;
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+
+      if (!outdent && start === end) {
+        const lineStart = val.lastIndexOf('\n', start - 1) + 1;
+        const lineEndRaw = val.indexOf('\n', start);
+        const lineEnd = lineEndRaw === -1 ? val.length : lineEndRaw;
+        const currentLine = val.slice(lineStart, lineEnd);
+        if (!/^(\s*[\*\-]|\s*\d+\.|\s*>)/.test(currentLine)) {
+          replaceTextareaRange(start, end, '  ', 2, 2);
+          return;
+        }
+      }
+
+      const { lineStart, lineEnd, blockText } = getSelectedLineBounds();
+      const lines = blockText.split('\n');
+      const transformed = lines.map(line => {
+        if (outdent) {
+          if (line.startsWith('  ')) return line.slice(2);
+          if (line.startsWith('\t') || line.startsWith(' ')) return line.slice(1);
+          return line;
+        }
+        return line.length > 0 ? '  ' + line : line;
+      });
+      const nextBlock = transformed.join('\n');
+      replaceTextareaRange(lineStart, lineEnd, nextBlock, 0, nextBlock.length);
+    }
+
+    function updateToolbarActiveStates() {
+      const val = textarea.value;
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      const { blockText } = getSelectedLineBounds();
+      const line = blockText.split('\n')[0].trim();
+
+      const activeMap = {
+        heading: /^==[^=]/.test(line) && /[^=]==$/.test(line),
+        subheading: /^===[^=]/.test(line) && /[^=]===$/.test(line),
+        bold: isWrappedByApostrophes(val, start, end, 3),
+        italic: isWrappedByApostrophes(val, start, end, 2),
+        'bold-italic': isWrappedByApostrophes(val, start, end, 5),
+        strike: val.slice(start - 2, start) === '~~' && val.slice(end, end + 2) === '~~',
+        code: val.slice(start - 1, start) === '`' && val.slice(end, end + 1) === '`',
+        bullet: /^\*\s+/.test(line),
+        ordered: /^\d+\.\s+/.test(line),
+        quote: /^>\s?/.test(line)
+      };
+
+      document.querySelectorAll('.editor-toolbar .toolbar-btn').forEach(btn => {
+        const action = btn.dataset.action;
+        btn.classList.toggle('is-active', Boolean(activeMap[action]));
+      });
+    }
+
+    // --- Interaktywne popovery narzędzi (.editor-popover) ---
+    function closePopover(restoreFocus = false) {
+      if (!popoverHost) return;
+      activePopoverType = null;
+      popoverHost.classList.add('hidden');
+      popoverHost.innerHTML = '';
+      if (restoreFocus) textarea.focus({ preventScroll: true });
+    }
+
+    function insertBlockOnLineBoundary(snippet) {
+      const val = textarea.value;
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      const before = val.slice(0, start);
+      const after = val.slice(end);
+      const needLeadingNl = before.length > 0 && !before.endsWith('\n\n')
+        ? (before.endsWith('\n') ? '\n' : '\n\n')
+        : '';
+      const needTrailingNl = after.length > 0 && !after.startsWith('\n\n')
+        ? (after.startsWith('\n') ? '\n' : '\n\n')
+        : '';
+      const full = needLeadingNl + snippet + needTrailingNl;
+      replaceTextareaRange(start, end, full, full.length, full.length);
+    }
+
+    function openPopover(type) {
+      if (isLockedAndNotAdmin) return;
+      if (activePopoverType === type && !popoverHost.classList.contains('hidden')) {
+        closePopover(true);
+        return;
+      }
+
+      const selStart = textarea.selectionStart;
+      const selEnd = textarea.selectionEnd;
+      const selectedText = textarea.value.slice(selStart, selEnd).trim();
+      activePopoverType = type;
+      popoverHost.classList.remove('hidden');
+
+      if (type === 'link') {
+        let linkMode = 'internal';
+        popoverHost.innerHTML = `
+          <div class="editor-popover-header">
+            <strong>🔗 Wstaw link</strong>
+            <button type="button" class="modal-close popover-close-btn" aria-label="Zamknij">&times;</button>
+          </div>
+          <div class="editor-popover-tabs" role="tablist">
+            <button type="button" class="editor-popover-tab active" data-link-tab="internal">Artykuł wiki [[...]]</button>
+            <button type="button" class="editor-popover-tab" data-link-tab="external">Link zewnętrzny [https://...]</button>
+          </div>
+          <div class="editor-popover-body">
+            <div id="popover-link-internal">
+              <div class="form-group">
+                <label for="popover-link-target">Cel (artykuł lub nazwa nowego hasła):</label>
+                <input type="text" id="popover-link-target" class="form-control" placeholder="Wyszukaj lub wpisz nazwę artykułu..." autocomplete="off" />
+              </div>
+              <div id="popover-link-list" class="link-picker-list"></div>
+              <div class="form-group">
+                <label for="popover-link-label">Wyświetlana etykieta (opcjonalnie):</label>
+                <input type="text" id="popover-link-label" class="form-control" value="${escapeHtml(selectedText)}" placeholder="Domyślnie nazwa celu" />
+              </div>
+            </div>
+            <div id="popover-link-external" class="hidden">
+              <div class="form-group">
+                <label for="popover-ext-url">Adres URL (http:// lub https://):</label>
+                <input type="url" id="popover-ext-url" class="form-control" placeholder="https://example.com" />
+              </div>
+              <div class="form-group">
+                <label for="popover-ext-label">Tekst linku (opcjonalnie):</label>
+                <input type="text" id="popover-ext-label" class="form-control" value="${escapeHtml(selectedText)}" placeholder="Opis odnośnika" />
+              </div>
+              <div id="popover-ext-error" class="form-error hidden"></div>
+            </div>
+          </div>
+          <div class="editor-popover-footer">
+            <button type="button" class="btn btn-sm btn-outline popover-cancel-btn">Anuluj</button>
+            <button type="button" id="popover-link-insert" class="btn btn-sm btn-primary">Wstaw link</button>
+          </div>
+        `;
+
+        const targetInput = document.getElementById('popover-link-target');
+        const labelInput = document.getElementById('popover-link-label');
+        const listEl = document.getElementById('popover-link-list');
+        const extUrlInput = document.getElementById('popover-ext-url');
+        const extLabelInput = document.getElementById('popover-ext-label');
+        const extErrEl = document.getElementById('popover-ext-error');
+
+        function renderSlugList() {
+          const q = targetInput.value.trim().toLocaleLowerCase('pl');
+          const matches = (state.allSlugs || [])
+            .map(s => ({ slug: s, title: state.articleTitlesBySlug[s] || s }))
+            .filter(item => !q || item.slug.includes(q) || item.title.toLocaleLowerCase('pl').includes(q))
+            .slice(0, 12);
+
+          if (matches.length === 0) {
+            listEl.innerHTML = '<div class="link-picker-empty">Brak dopasowanych haseł — wstawienie utworzy czerwony link do nowego artykułu.</div>';
+            return;
+          }
+          listEl.innerHTML = matches.map(item => `
+            <button type="button" class="link-picker-item" data-title="${escapeHtml(item.title)}" data-slug="${escapeHtml(item.slug)}">
+              <span class="link-picker-title">${escapeHtml(item.title)}</span>
+              <span class="link-picker-slug">${escapeHtml(item.slug)}</span>
+            </button>
+          `).join('');
+
+          listEl.querySelectorAll('.link-picker-item').forEach(btn => {
+            btn.addEventListener('click', () => {
+              targetInput.value = btn.dataset.title;
+              if (!labelInput.value.trim() && selectedText) {
+                labelInput.value = selectedText;
+              }
+              targetInput.focus();
+            });
+          });
+        }
+
+        targetInput.addEventListener('input', renderSlugList);
+        renderSlugList();
+
+        popoverHost.querySelectorAll('.editor-popover-tab').forEach(tab => {
+          tab.addEventListener('click', () => {
+            linkMode = tab.dataset.linkTab;
+            popoverHost.querySelectorAll('.editor-popover-tab').forEach(t => t.classList.toggle('active', t === tab));
+            document.getElementById('popover-link-internal').classList.toggle('hidden', linkMode !== 'internal');
+            document.getElementById('popover-link-external').classList.toggle('hidden', linkMode !== 'external');
+            if (linkMode === 'internal') targetInput.focus();
+            else extUrlInput.focus();
+          });
+        });
+
+        const submitLink = () => {
+          if (linkMode === 'internal') {
+            const target = targetInput.value.trim() || selectedText || 'Nazwa artykułu';
+            const label = labelInput.value.trim();
+            const snippet = (label && label !== target) ? `[[${target}|${label}]]` : `[[${target}]]`;
+            closePopover(false);
+            replaceTextareaRange(selStart, selEnd, snippet, snippet.length, snippet.length);
+          } else {
+            const url = extUrlInput.value.trim();
+            if (!/^https?:\/\//i.test(url) || !isSafeUrl(url)) {
+              extErrEl.textContent = 'Podaj poprawny adres URL zaczynający się od http:// lub https://.';
+              extErrEl.classList.remove('hidden');
+              extUrlInput.focus();
+              return;
+            }
+            const label = extLabelInput.value.trim();
+            const snippet = label ? `[${url} ${label}]` : `[${url} ${url}]`;
+            closePopover(false);
+            replaceTextareaRange(selStart, selEnd, snippet, snippet.length, snippet.length);
+          }
+        };
+
+        document.getElementById('popover-link-insert').addEventListener('click', submitLink);
+        targetInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitLink(); } });
+        extUrlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitLink(); } });
+        targetInput.focus();
+      } else if (type === 'table') {
+        popoverHost.innerHTML = `
+          <div class="editor-popover-header">
+            <strong>📊 Generator tabeli</strong>
+            <button type="button" class="modal-close popover-close-btn" aria-label="Zamknij">&times;</button>
+          </div>
+          <div class="editor-popover-body">
+            <div class="editor-meta-grid">
+              <div class="form-group">
+                <label for="popover-table-cols">Kolumny (1–10):</label>
+                <input type="number" id="popover-table-cols" class="form-control" min="1" max="10" value="3" />
+              </div>
+              <div class="form-group">
+                <label for="popover-table-rows">Wiersze danych (1–20):</label>
+                <input type="number" id="popover-table-rows" class="form-control" min="1" max="20" value="2" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="popover-table-align">Wyrównanie kolumn:</label>
+              <select id="popover-table-align" class="form-control">
+                <option value="left">Do lewej (:---)</option>
+                <option value="center">Wyśrodkowane (:---:)</option>
+                <option value="right">Do prawej (---:)</option>
+              </select>
+            </div>
+          </div>
+          <div class="editor-popover-footer">
+            <button type="button" class="btn btn-sm btn-outline popover-cancel-btn">Anuluj</button>
+            <button type="button" id="popover-table-insert" class="btn btn-sm btn-primary">Wstaw tabelę</button>
+          </div>
+        `;
+
+        const colsInput = document.getElementById('popover-table-cols');
+        const rowsInput = document.getElementById('popover-table-rows');
+        const alignInput = document.getElementById('popover-table-align');
+
+        document.getElementById('popover-table-insert').addEventListener('click', () => {
+          const cols = Math.max(1, Math.min(10, parseInt(colsInput.value, 10) || 3));
+          const rows = Math.max(1, Math.min(20, parseInt(rowsInput.value, 10) || 2));
+          const align = alignInput.value;
+          const sepToken = align === 'center' ? ':---:' : align === 'right' ? '---:' : '---';
+
+          const headerCells = Array.from({ length: cols }, (_, c) => `Kolumna ${c + 1}`);
+          const sepCells = Array.from({ length: cols }, () => sepToken);
+          const lines = [
+            `| ${headerCells.join(' | ')} |`,
+            `| ${sepCells.join(' | ')} |`
+          ];
+          for (let r = 0; r < rows; r++) {
+            const dataCells = Array.from({ length: cols }, (_, c) => `Komórka ${r + 1}.${c + 1}`);
+            lines.push(`| ${dataCells.join(' | ')} |`);
+          }
+          closePopover(false);
+          insertBlockOnLineBoundary(lines.join('\n'));
+        });
+        colsInput.focus();
+      } else if (type === 'image') {
+        popoverHost.innerHTML = `
+          <div class="editor-popover-header">
+            <strong>🖼️ Wstaw ilustrację</strong>
+            <button type="button" class="modal-close popover-close-btn" aria-label="Zamknij">&times;</button>
+          </div>
+          <div class="editor-popover-body">
+            <div class="form-group">
+              <label for="popover-img-url">Adres URL obrazka (http://, https:// lub /...):</label>
+              <input type="text" id="popover-img-url" class="form-control" placeholder="https://..." />
+            </div>
+            <div class="form-group">
+              <label for="popover-img-alt">Tekst alternatywny (alt):</label>
+              <input type="text" id="popover-img-alt" class="form-control" value="${escapeHtml(selectedText)}" placeholder="Krótki opis obrazu" />
+            </div>
+            <div class="form-group">
+              <label for="popover-img-caption">Podpis pod ilustracją (opcjonalny):</label>
+              <input type="text" id="popover-img-caption" class="form-control" placeholder="Np. Widok ogólny w 2024 roku" />
+            </div>
+            <div id="popover-img-error" class="form-error hidden"></div>
+          </div>
+          <div class="editor-popover-footer">
+            <button type="button" class="btn btn-sm btn-outline popover-cancel-btn">Anuluj</button>
+            <button type="button" id="popover-img-insert" class="btn btn-sm btn-primary">Wstaw obraz</button>
+          </div>
+        `;
+
+        const urlInput = document.getElementById('popover-img-url');
+        const altInput = document.getElementById('popover-img-alt');
+        const capInput = document.getElementById('popover-img-caption');
+        const errEl = document.getElementById('popover-img-error');
+
+        document.getElementById('popover-img-insert').addEventListener('click', () => {
+          const url = urlInput.value.trim();
+          if (!isSafeUrl(url)) {
+            errEl.textContent = 'Dozwolone są wyłącznie bezpieczne adresy http://, https:// lub ścieżki względne /...';
+            errEl.classList.remove('hidden');
+            urlInput.focus();
+            return;
+          }
+          const alt = altInput.value.trim() || 'Ilustracja';
+          const cap = capInput.value.trim().replace(/"/g, "'");
+          const snippet = cap ? `![${alt}](${url} "${cap}")` : `![${alt}](${url})`;
+          closePopover(false);
+          insertBlockOnLineBoundary(snippet);
+        });
+        urlInput.focus();
+      } else if (type === 'callout') {
+        popoverHost.innerHTML = `
+          <div class="editor-popover-header">
+            <strong>💡 Wstaw ramkę informacyjną</strong>
+            <button type="button" class="modal-close popover-close-btn" aria-label="Zamknij">&times;</button>
+          </div>
+          <div class="editor-popover-body">
+            <div class="editor-meta-grid">
+              <div class="form-group">
+                <label for="popover-callout-type">Typ ramki:</label>
+                <select id="popover-callout-type" class="form-control">
+                  <option value="note">Notatka (note)</option>
+                  <option value="tip">Wskazówka (tip)</option>
+                  <option value="warning">Ostrzeżenie (warning)</option>
+                  <option value="important">Ważne (important)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="popover-callout-title">Tytuł ramki (opcjonalny):</label>
+                <input type="text" id="popover-callout-title" class="form-control" placeholder="Np. Warto wiedzieć" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="popover-callout-body">Treść ramki:</label>
+              <textarea id="popover-callout-body" class="form-control" rows="3" placeholder="Wpisz treść ramki...">${escapeHtml(selectedText)}</textarea>
+            </div>
+          </div>
+          <div class="editor-popover-footer">
+            <button type="button" class="btn btn-sm btn-outline popover-cancel-btn">Anuluj</button>
+            <button type="button" id="popover-callout-insert" class="btn btn-sm btn-primary">Wstaw ramkę</button>
+          </div>
+        `;
+
+        const typeSelect = document.getElementById('popover-callout-type');
+        const titleField = document.getElementById('popover-callout-title');
+        const bodyField = document.getElementById('popover-callout-body');
+
+        document.getElementById('popover-callout-insert').addEventListener('click', () => {
+          const cType = typeSelect.value;
+          const cTitle = titleField.value.trim();
+          const cBody = bodyField.value.trim() || 'Treść uwagi lub wskazówki.';
+          const headerLine = cTitle ? `:::${cType} ${cTitle}` : `:::${cType}`;
+          const snippet = `${headerLine}\n${cBody}\n:::`;
+          closePopover(false);
+          insertBlockOnLineBoundary(snippet);
+        });
+        typeSelect.focus();
+      } else if (type === 'ref') {
+        popoverHost.innerHTML = `
+          <div class="editor-popover-header">
+            <strong>📑 Wstaw przypis (&lt;ref&gt;)</strong>
+            <button type="button" class="modal-close popover-close-btn" aria-label="Zamknij">&times;</button>
+          </div>
+          <div class="editor-popover-body">
+            <div class="form-group">
+              <label for="popover-ref-text">Treść przypisu / źródło:</label>
+              <textarea id="popover-ref-text" class="form-control" rows="2" placeholder="Np. Encyklopedia PWN, 2024 lub [https://... Opis źródła]">${escapeHtml(selectedText)}</textarea>
+            </div>
+          </div>
+          <div class="editor-popover-footer">
+            <button type="button" class="btn btn-sm btn-outline popover-cancel-btn">Anuluj</button>
+            <button type="button" id="popover-ref-insert" class="btn btn-sm btn-primary">Wstaw przypis</button>
+          </div>
+        `;
+
+        const refInput = document.getElementById('popover-ref-text');
+        const submitRef = () => {
+          const refText = refInput.value.trim() || 'Źródło lub komentarz';
+          const snippet = `<ref>${refText}</ref>`;
+          closePopover(false);
+          replaceTextareaRange(selStart, selEnd, snippet, snippet.length, snippet.length);
+        };
+        document.getElementById('popover-ref-insert').addEventListener('click', submitRef);
+        refInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            submitRef();
+          }
+        });
+        refInput.focus();
+      }
+
+      popoverHost.querySelector('.popover-close-btn')?.addEventListener('click', () => closePopover(true));
+      popoverHost.querySelector('.popover-cancel-btn')?.addEventListener('click', () => closePopover(true));
+    }
+
+    // Zamykanie popovera kliknięciem poza nim
+    const onDocumentClickForPopover = (e) => {
+      if (!popoverHost || popoverHost.classList.contains('hidden')) return;
+      if (!popoverHost.contains(e.target) && !e.target.closest('.editor-toolbar')) {
+        closePopover(false);
+      }
+    };
+    document.addEventListener('click', onDocumentClickForPopover);
 
     // Obsługa przycisków paska narzędzi
     document.querySelectorAll('.editor-toolbar .toolbar-btn').forEach(btn => {
       btn.addEventListener('click', () => {
+        if (isLockedAndNotAdmin) return;
         const action = btn.dataset.action;
-        if (action === 'heading') insertAroundSelection('\n== ', ' ==\n');
-        if (action === 'subheading') insertAroundSelection('\n=== ', ' ===\n');
-        if (action === 'bold') insertAroundSelection("'''", "'''");
-        if (action === 'italic') insertAroundSelection("''", "''");
-        if (action === 'link') insertAroundSelection('[[', ']]');
-        if (action === 'ref') insertAroundSelection('<ref>', '</ref>');
-        if (action === 'bullet') insertAroundSelection('\n* ');
-        if (action === 'table') {
-          insertAroundSelection(
-            '\n{| class="wiki-table"\n! Nagłówek 1 !! Nagłówek 2\n|-\n| Dane 1 || Dane 2\n|-\n| Dane 3 || Dane 4\n|}\n',
-            ''
-          );
-        }
-        if (action === 'code') {
-          insertAroundSelection('`', '`');
-        }
-        if (action === 'upload-image') {
-          fileUploadInput?.click();
-        }
-        if (action === 'infobox-helper') {
-          const infoboxPanel = document.getElementById('editor-infobox-panel');
-          if (infoboxPanel) {
-            infoboxPanel.open = true;
-            infoboxPanel.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            document.getElementById('infobox-title')?.focus();
-          } else {
-            const infoboxFieldset = document.querySelector('.infobox-editor-fieldset');
-            if (infoboxFieldset) {
-              infoboxFieldset.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              document.getElementById('infobox-title')?.focus();
-            } else {
-              addInfoboxRow('Klucz', 'Wartość');
-              triggerLivePreview();
-            }
-          }
-          showToast('Rozwinięto sekcję infoboksu', 'info');
+        if (action === 'heading') toggleHeading(2);
+        else if (action === 'subheading') toggleHeading(3);
+        else if (action === 'bold') toggleInlineWrap("'''", "'''", 'pogrubiony tekst');
+        else if (action === 'italic') toggleInlineWrap("''", "''", 'kursywa');
+        else if (action === 'bold-italic') toggleInlineWrap("'''''", "'''''", 'pogrubiona kursywa');
+        else if (action === 'strike') toggleInlineWrap('~~', '~~', 'tekst przekreślony');
+        else if (action === 'code') toggleInlineWrap('`', '`', 'kod');
+        else if (action === 'bullet') toggleLinePrefix('bullet');
+        else if (action === 'ordered') toggleLinePrefix('ordered');
+        else if (action === 'quote') toggleLinePrefix('quote');
+        else if (action === 'codeblock') insertCodeBlock();
+        else if (action === 'hr') insertHorizontalRule();
+        else if (action === 'link') openPopover('link');
+        else if (action === 'ref') openPopover('ref');
+        else if (action === 'table') openPopover('table');
+        else if (action === 'image') openPopover('image');
+        else if (action === 'callout') openPopover('callout');
+        else if (action === 'infobox-helper') {
+          addInfoboxRow('', '', true);
+          showToast('Dodano nowe puste pole infoboxu poniżej.', 'info');
         }
       });
     });
 
-    // Przycisk Trybu Zen w nagłówku edytora
-    document.getElementById('zen-toggle-btn')?.addEventListener('click', () => {
-      toggleZenMode();
-    });
-
-    // Szybki przycisk zapisu w nagłówku edytora
-    document.getElementById('editor-top-save-btn')?.addEventListener('click', () => {
-      if (!isLockedAndNotAdmin) {
-        editorForm.requestSubmit();
-      }
-    });
-
-    // Przełączanie trybów edytora (split / editor / preview)
-    const leftPane = document.getElementById('editor-left-pane');
-    const previewPane = document.getElementById('editor-live-preview-pane');
-
-    document.querySelectorAll('.editor-mode-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.querySelectorAll('.editor-mode-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        const mode = btn.dataset.mode;
-
-        if (mode === 'split') {
-          leftPane.style.display = 'block';
-          previewPane.style.display = 'block';
-        } else if (mode === 'editor') {
-          leftPane.style.display = 'block';
-          previewPane.style.display = 'none';
-        } else if (mode === 'preview') {
-          leftPane.style.display = 'none';
-          previewPane.style.display = 'block';
-          triggerLivePreview();
-        }
-      });
-    });
-
-    // Nasłuch zmian w edytorze dla live preview, auto-save i metryk
-    textarea.addEventListener('input', () => {
-      updateEditorMetrics();
-      triggerLivePreview();
-      triggerAutoSave();
-    });
-    document.getElementById('edit-title')?.addEventListener('input', () => {
-      updateSlugPreview();
-      triggerLivePreview();
-      triggerAutoSave();
-    });
-    document.getElementById('infobox-title')?.addEventListener('input', () => {
-      triggerLivePreview();
-      triggerAutoSave();
-    });
-    document.getElementById('infobox-image')?.addEventListener('input', () => {
-      triggerLivePreview();
-      triggerAutoSave();
-    });
-
-    // Skróty klawiszowe w edytorze (Ctrl+S, Ctrl+B, Ctrl+I, F11)
-    const editorForm = document.getElementById('article-editor-form');
+    // Skróty klawiszowe wewnątrz #edit-content
     textarea.addEventListener('keydown', (e) => {
-      if (e.key === 'F11') {
+      if (e.key === 'Escape' && popoverHost && !popoverHost.classList.contains('hidden')) {
         e.preventDefault();
-        toggleZenMode();
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
-        e.preventDefault();
-        insertAroundSelection("'''", "'''");
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'i') {
-        e.preventDefault();
-        insertAroundSelection("''", "''");
+        closePopover(true);
+        return;
       }
-    });
 
-    editorForm.addEventListener('keydown', (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      if (e.key === 'Tab') {
         e.preventDefault();
         if (!isLockedAndNotAdmin) {
-          editorForm.requestSubmit();
+          indentSelectedLines(e.shiftKey);
         }
+        return;
+      }
+
+      const mod = e.ctrlKey || e.metaKey;
+      if (!mod) return;
+
+      const lower = e.key.toLowerCase();
+      if (lower === 'b' && !e.shiftKey) {
+        e.preventDefault();
+        if (!isLockedAndNotAdmin) toggleInlineWrap("'''", "'''", 'pogrubiony tekst');
+      } else if (lower === 'i' && !e.shiftKey) {
+        e.preventDefault();
+        if (!isLockedAndNotAdmin) toggleInlineWrap("''", "''", 'kursywa');
+      } else if (lower === 'k' && !e.shiftKey) {
+        e.preventDefault();
+        if (!isLockedAndNotAdmin) openPopover('link');
+      } else if (lower === 's' && !e.shiftKey) {
+        e.preventDefault();
+        if (!isLockedAndNotAdmin) formEl.requestSubmit();
+      } else if (lower === 'p' && e.shiftKey) {
+        e.preventDefault();
+        const modes = ['edit', 'split', 'preview'];
+        const nextMode = modes[(modes.indexOf(editorMode) + 1) % modes.length];
+        setEditorMode(nextMode);
       }
     });
 
-    // Inicjalizacja metryk i sluga
-    updateEditorMetrics();
-    updateSlugPreview();
+    // Zdarzenia pól formularza i kursora
+    titleInput.addEventListener('input', onEditorDataChanged);
+    summaryInput.addEventListener('input', onEditorDataChanged);
+    infoboxTitleInput.addEventListener('input', onEditorDataChanged);
+    infoboxImageInput.addEventListener('input', onEditorDataChanged);
+    commentInput.addEventListener('input', () => {
+      if (autosaveTimer) clearTimeout(autosaveTimer);
+      autosaveTimer = setTimeout(saveLocalDraft, 800);
+    });
 
-    // Inicjalne renderowanie podglądu na żywo
-    triggerLivePreview();
+    textarea.addEventListener('input', onEditorDataChanged);
+    textarea.addEventListener('keyup', () => {
+      updateEditorStatusBar();
+      updateToolbarActiveStates();
+    });
+    textarea.addEventListener('mouseup', () => {
+      updateEditorStatusBar();
+      updateToolbarActiveStates();
+    });
+    textarea.addEventListener('click', () => {
+      updateEditorStatusBar();
+      updateToolbarActiveStates();
+    });
 
-    // Zapis formularza
-    editorForm.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      if (isLockedAndNotAdmin) {
-        showToast('Artykuł jest zabezpieczony. Brak uprawnień do zapisu.', 'error');
-        return;
+    // Presety komentarza edycji
+    document.querySelectorAll('.edit-summary-presets .summary-chip-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (isLockedAndNotAdmin) return;
+        const text = btn.dataset.summary || '';
+        const current = commentInput.value.trim();
+        if (!current) {
+          commentInput.value = text;
+        } else if (!current.includes(text)) {
+          commentInput.value = `${current}; ${text}`;
+        }
+        commentInput.focus();
+      });
+    });
+
+    // Guard przed opuszczeniem strony (beforeunload + Anuluj)
+    const beforeUnloadHandler = (e) => {
+      if (isEditorDirty()) {
+        e.preventDefault();
+        e.returnValue = '';
       }
+    };
+    window.addEventListener('beforeunload', beforeUnloadHandler);
 
-      const title = document.getElementById('edit-title').value.trim();
-      const summary = document.getElementById('edit-summary').value.trim();
-      const content = textarea.value.trim();
-      const rawCats = document.getElementById('edit-categories').value;
-      const edit_comment = document.getElementById('edit-comment').value.trim();
+    const cancelLink = document.getElementById('editor-cancel-link');
+    if (cancelLink) {
+      cancelLink.addEventListener('click', (e) => {
+        e.preventDefault();
+        navigateWithGuard(cancelLink.getAttribute('href'));
+      });
+    }
+
+    // Rejestracja globalnego strażnika aktywnego edytora
+    if (activeEditorGuard) activeEditorGuard.cleanup();
+    activeEditorGuard = {
+      currentHash: window.location.hash || '#/',
+      isDirty: isEditorDirty,
+      cleanup: () => {
+        window.removeEventListener('beforeunload', beforeUnloadHandler);
+        document.removeEventListener('click', onDocumentClickForPopover);
+        if (previewDebounceTimer) clearTimeout(previewDebounceTimer);
+        if (autosaveTimer) clearTimeout(autosaveTimer);
+        if (previewAbortController) previewAbortController.abort();
+      }
+    };
+
+    // Inicjalizacja widoków edytora
+    updateSlugPreview();
+    renderCategoryPicker();
+    updateEditorStatusBar();
+    updateToolbarActiveStates();
+    updateDirtyBadge();
+    checkExistingDraft();
+    if (editorMode === 'split' || editorMode === 'preview') {
+      runLivePreview();
+    }
+
+    // --- Zapis formularza ---
+    async function submitArticleForm(forceOverwrite = false) {
+      if (isLockedAndNotAdmin) return;
+
+      const title = titleInput.value.trim();
+      const summary = summaryInput.value.trim();
+      const content = textarea.value;
+      const categories = getEffectiveCategories();
+      const edit_comment = commentInput.value.trim();
 
       if (!title) {
-        showToast('Podaj tytuł artykułu', 'warning');
-        document.getElementById('edit-title').focus();
+        showToast('Podaj tytuł artykułu.', 'warning');
+        titleInput.focus();
         return;
       }
-      if (!content) {
-        showToast('Wpisz treść artykułu', 'warning');
+
+      if (isNew && !slugifyTitle(title)) {
+        showToast('Tytuł musi zawierać litery lub cyfry, aby utworzyć adres URL.', 'warning');
+        titleInput.focus();
+        return;
+      }
+
+      if (!content.trim()) {
+        showToast('Treść artykułu nie może być pusta.', 'warning');
         textarea.focus();
         return;
       }
 
-      const categories = rawCats
-        .split(',')
-        .map(c => c.trim())
-        .filter(c => c.length > 0);
+      const infoboxResult = collectInfoboxData({ strict: true });
+      if (infoboxResult && infoboxResult.error) {
+        return;
+      }
+      const infobox = infoboxResult;
 
-      const infobox = collectInfoboxData();
       const saveBtn = document.getElementById('editor-save-btn');
-      const topSaveBtn = document.getElementById('editor-top-save-btn');
+      const prevBtnHtml = saveBtn ? saveBtn.innerHTML : '';
       if (saveBtn) {
         saveBtn.disabled = true;
         saveBtn.textContent = 'Zapisywanie...';
       }
-      if (topSaveBtn) {
-        topSaveBtn.disabled = true;
-        topSaveBtn.textContent = 'Zapisywanie...';
-      }
 
       try {
+        conflictBannerEl.classList.add('hidden');
+        conflictBannerEl.innerHTML = '';
+
         if (isNew) {
           const res = await api('/api/articles', {
             method: 'POST',
-            body: { title, summary, content, infobox, categories, edit_comment: edit_comment || 'Utworzenie artykułu' }
+            body: { title, summary, content, infobox, categories, edit_comment }
           });
-          safeRemoveStorage(draftStorageKey);
+          clearLocalDraft();
+          if (activeEditorGuard) {
+            activeEditorGuard.cleanup();
+            activeEditorGuard = null;
+          }
+          await refreshBootstrapMetadata();
           showToast('Artykuł został pomyślnie utworzony!', 'success');
-          window.location.hash = `#/wiki/${encodeURIComponent(res.article.slug)}`;
+          window.location.hash = `#/wiki/${res.article.slug}`;
         } else {
+          const bodyPayload = {
+            title,
+            summary,
+            content,
+            infobox,
+            categories,
+            edit_comment
+          };
+          if (baseUpdatedAt && !forceOverwrite) {
+            bodyPayload.base_updated_at = baseUpdatedAt;
+          }
+
           const res = await api(`/api/articles/${encodeURIComponent(slug)}`, {
             method: 'PUT',
-            body: { title, summary, content, infobox, categories, edit_comment: edit_comment || 'Edycja artykułu' }
+            body: bodyPayload
           });
-          safeRemoveStorage(draftStorageKey);
+          clearLocalDraft();
+          if (activeEditorGuard) {
+            activeEditorGuard.cleanup();
+            activeEditorGuard = null;
+          }
+          await refreshBootstrapMetadata();
           showToast('Zmiany w artykule zostały zapisane!', 'success');
-          window.location.hash = `#/wiki/${encodeURIComponent(res.article.slug)}`;
+          window.location.hash = `#/wiki/${res.article.slug}`;
         }
       } catch (err) {
-        showToast(err.message, 'error');
-        if (saveBtn) {
-          saveBtn.disabled = false;
-          saveBtn.textContent = isNew ? '💾 Utwórz artykuł' : '💾 Zapisz zmiany';
+        if (err.status === 409 && err.data && err.data.conflict && err.data.currentArticle) {
+          const srv = err.data.currentArticle;
+          const srvEditor = srv.last_editor || srv.editor || 'innego redaktora';
+          conflictBannerEl.classList.remove('hidden');
+          conflictBannerEl.innerHTML = `
+            <div>
+              <strong>⚠️ Wykryto konflikt edycji (409):</strong> Artykuł został w międzyczasie zmodyfikowany (${escapeHtml(formatDate(srv.updated_at))} przez <em>${escapeHtml(srvEditor)}</em>).
+            </div>
+            <div class="conflict-banner-actions">
+              <button type="button" id="conflict-reload-btn" class="btn btn-sm btn-outline">Wczytaj najnowszą wersję z serwera</button>
+              <button type="button" id="conflict-force-btn" class="btn btn-sm btn-danger">Nadpisz moją wersją</button>
+            </div>
+          `;
+
+          document.getElementById('conflict-reload-btn')?.addEventListener('click', () => {
+            if (activeEditorGuard) {
+              activeEditorGuard.cleanup();
+              activeEditorGuard = null;
+            }
+            renderArticleEditor(slug);
+          });
+
+          document.getElementById('conflict-force-btn')?.addEventListener('click', () => {
+            baseUpdatedAt = srv.updated_at;
+            submitArticleForm(true);
+          });
+          conflictBannerEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        } else {
+          showToast(err.message, 'error');
         }
-        if (topSaveBtn) {
-          topSaveBtn.disabled = false;
-          topSaveBtn.textContent = isNew ? '💾 Utwórz artykuł' : '💾 Zapisz';
+      } finally {
+        if (saveBtn) {
+          saveBtn.disabled = isLockedAndNotAdmin;
+          saveBtn.innerHTML = prevBtnHtml;
         }
       }
+    }
+
+    formEl.addEventListener('submit', (e) => {
+      e.preventDefault();
+      submitArticleForm(false);
     });
   }
 
   // --- WIDOK 5: Dyskusja artykułu (#/wiki/:slug/talk) ---
   async function renderTalkView(slug) {
     const viewRoot = document.getElementById('view-root');
-    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie dyskusji...</div>';
 
     try {
@@ -1964,55 +2644,7 @@
       const talkData = await api(`/api/articles/${encodeURIComponent(slug)}/talk`);
       const messages = talkData.messages || [];
 
-      setPageTitle(`Dyskusja: ${artData.article.title}`);
       updateArticleTabs(slug, 'talk', artData.revisionsCount, messages.length);
-
-      function renderTalkQuoteContent(rawText) {
-        if (!rawText) return '';
-        const lines = rawText.split('\n');
-        const output = [];
-        let quoteBuffer = [];
-
-        for (const line of lines) {
-          if (line.startsWith('>')) {
-            quoteBuffer.push(line.replace(/^>\s?/, ''));
-          } else {
-            if (quoteBuffer.length > 0) {
-              output.push(`<blockquote class="talk-quote-block">${escapeHtml(quoteBuffer.join('\n'))}</blockquote>`);
-              quoteBuffer = [];
-            }
-            if (line.trim() !== '') {
-              output.push(escapeHtml(line));
-            }
-          }
-        }
-        if (quoteBuffer.length > 0) {
-          output.push(`<blockquote class="talk-quote-block">${escapeHtml(quoteBuffer.join('\n'))}</blockquote>`);
-        }
-        return output.join('<br />').replace(/(<\/blockquote>)<br \/>/g, '$1');
-      }
-
-      function getAuthorRoleInfo(author, msgRole) {
-        const role = (msgRole || '').toLowerCase();
-        if (role === 'admin') return { label: 'Administrator', cssClass: 'role-admin' };
-        if (role === 'editor') return { label: 'Redaktor', cssClass: 'role-editor' };
-        if (role === 'user') return { label: 'Użytkownik', cssClass: 'role-user' };
-        if (role === 'blocked') return { label: 'Zablokowany', cssClass: 'role-blocked' };
-        if (role === 'anon') return { label: 'Anonim', cssClass: 'role-anon' };
-
-        const lowerAuthor = (author || '').trim().toLowerCase();
-        if (lowerAuthor === 'admin') return { label: 'Administrator', cssClass: 'role-admin' };
-        if (lowerAuthor === 'redaktor') return { label: 'Redaktor', cssClass: 'role-editor' };
-        if (state.currentUser && state.currentUser.username.toLowerCase() === lowerAuthor) {
-          if (state.currentUser.role === 'admin') return { label: 'Administrator', cssClass: 'role-admin' };
-          if (state.currentUser.role === 'editor') return { label: 'Redaktor', cssClass: 'role-editor' };
-          if (state.currentUser.role === 'user') return { label: 'Użytkownik', cssClass: 'role-user' };
-        }
-        if (!lowerAuthor || lowerAuthor === 'anonim' || lowerAuthor === 'anonymous') {
-          return { label: 'Anonim', cssClass: 'role-anon' };
-        }
-        return { label: 'Użytkownik', cssClass: 'role-user' };
-      }
 
       viewRoot.innerHTML = `
         <div class="talk-thread">
@@ -2026,109 +2658,43 @@
               <div class="talk-empty">
                 <p>Brak wpisów w dyskusji nad tym hasłem. Bądź pierwszą osobą, która zabierze głos!</p>
               </div>
-            ` : messages.map(msg => {
-              const roleInfo = getAuthorRoleInfo(msg.author, msg.author_role);
-              return `
-                <div class="talk-message-card" id="talk-msg-${msg.id}">
-                  <div class="talk-message-header talk-msg-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-                    <div class="talk-author-info" style="display:flex; align-items:center;">
-                      <span class="talk-message-author talk-author">💬 <strong>${escapeHtml(msg.author || 'Anonim')}</strong></span>
-                      <span class="talk-role-badge ${roleInfo.cssClass}">${escapeHtml(roleInfo.label)}</span>
-                    </div>
-                    <div style="display:flex; align-items:center; gap:8px;">
-                      <span class="talk-message-date talk-date">${formatDate(msg.created_at)}</span>
-                      <button type="button" class="btn btn-sm btn-outline-secondary btn-quote-reply" data-author="${escapeHtml(msg.author || 'Anonim')}" data-content="${escapeHtml(msg.content)}" title="Odpowiedz z cytatem" aria-label="Odpowiedz z cytatem">💬 Cytuj</button>
-                    </div>
-                  </div>
-                  <div class="talk-message-content talk-msg-content">${renderTalkQuoteContent(msg.content)}</div>
+            ` : messages.map(msg => `
+              <div class="talk-message-card" id="talk-msg-${msg.id}">
+                <div class="talk-msg-header">
+                  <span class="talk-author">💬 <strong>${escapeHtml(msg.author || 'Anonim')}</strong></span>
+                  <span class="talk-date">${formatDate(msg.created_at)}</span>
                 </div>
-              `;
-            }).join('')}
+                <div class="talk-msg-content">${escapeHtml(msg.content)}</div>
+              </div>
+            `).join('')}
           </div>
 
-          <!-- Formularz dodania wypowiedzi -->
           <div class="talk-form-card">
-            <h3>Dodaj nową wypowiedź do wątku</h3>
+            <h3 class="talk-form-title">Dodaj nową wypowiedź do wątku</h3>
             <form id="talk-add-form" class="talk-form">
               <div class="form-group">
                 <label for="talk-author-input">Twój podpis / autor:</label>
                 <input type="text" id="talk-author-input" class="form-control" value="${escapeHtml(state.currentUser ? state.currentUser.username : '')}" placeholder="Podpis (lub pozostaw puste dla Anonim)" ${state.currentUser ? 'readonly' : ''} />
               </div>
               <div class="form-group">
-                <label for="talk-content-input">Treść wiadomości: <span class="required">*</span></label>
-                <!-- Mini toolbar formatowania dyskusji -->
-                <div class="talk-mini-toolbar" role="toolbar" aria-label="Formatowanie tekstu dyskusji">
-                  <button type="button" class="btn btn-sm btn-outline btn-talk-tool" data-action="bold" title="Pogrubienie ('''tekst''')"><strong>B</strong></button>
-                  <button type="button" class="btn btn-sm btn-outline btn-talk-tool" data-action="italic" title="Kursywa (''tekst'')"><em>I</em></button>
-                  <button type="button" class="btn btn-sm btn-outline btn-talk-tool" data-action="link" title="Link wewnętrzny ([[...]])">🔗 Link</button>
-                  <button type="button" class="btn btn-sm btn-outline btn-talk-tool" data-action="quote" title="Cytat (&gt;)">❝ Cytat</button>
-                </div>
+                <label for="talk-content-input">Treść wiadomości:</label>
                 <textarea id="talk-content-input" class="form-control" rows="4" placeholder="Wpisz treść swojej uwagi lub propozycji do artykułu..." required></textarea>
               </div>
-              <button type="submit" id="talk-submit-btn" class="btn btn-primary">Wyślij wypowiedź</button>
+              <button type="submit" class="btn btn-primary">Wyślij wypowiedź</button>
             </form>
           </div>
         </div>
       `;
 
-      // Obsługa przycisków "Odpowiedz z cytatem" (.btn-quote-reply)
-      document.querySelectorAll('.btn-quote-reply').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const author = btn.dataset.author || 'Anonim';
-          const content = btn.dataset.content || '';
-          const quoteLines = content.trim().split('\n').map(l => `> ${l}`).join('\n');
-          const quoteBlock = `> [${author}]:\n${quoteLines}\n\n`;
-
-          const textarea = document.getElementById('talk-content-input');
-          if (textarea) {
-            textarea.value = textarea.value ? `${textarea.value.trim()}\n\n${quoteBlock}` : quoteBlock;
-            textarea.focus();
-            textarea.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-          }
-        });
-      });
-
-      // Obsługa mini-toolbara w formularzu dyskusji
-      const talkTextarea = document.getElementById('talk-content-input');
-      document.querySelectorAll('.talk-mini-toolbar .btn-talk-tool').forEach(toolBtn => {
-        toolBtn.addEventListener('click', () => {
-          if (!talkTextarea) return;
-          const action = toolBtn.dataset.action;
-          const start = talkTextarea.selectionStart;
-          const end = talkTextarea.selectionEnd;
-          const sel = talkTextarea.value.substring(start, end);
-
-          let before = '';
-          let after = '';
-          if (action === 'bold') { before = "'''"; after = "'''"; }
-          else if (action === 'italic') { before = "''"; after = "''"; }
-          else if (action === 'link') { before = "[["; after = "]]"; }
-          else if (action === 'quote') { before = "\n> "; after = "\n"; }
-
-          const replacement = before + (sel || (action === 'quote' ? 'Treść cytatu' : 'tekst')) + after;
-          talkTextarea.value = talkTextarea.value.substring(0, start) + replacement + talkTextarea.value.substring(end);
-          talkTextarea.focus();
-          const newCursor = start + before.length + (sel ? sel.length : (action === 'quote' ? 12 : 5));
-          talkTextarea.setSelectionRange(newCursor, newCursor);
-        });
-      });
-
-      const talkForm = document.getElementById('talk-add-form');
-      talkForm.addEventListener('submit', async (e) => {
+      document.getElementById('talk-add-form').addEventListener('submit', async (e) => {
         e.preventDefault();
         const author = document.getElementById('talk-author-input').value.trim() || (state.currentUser ? state.currentUser.username : 'Anonim');
         const content = document.getElementById('talk-content-input').value.trim();
 
         if (!content) {
-          showToast('Wpisz treść wiadomości przed wysłaniem', 'warning');
-          document.getElementById('talk-content-input').focus();
+          showToast('Wpisz treść wiadomości przed wysłaniem.', 'warning');
           return;
         }
-
-        const submitBtn = document.getElementById('talk-submit-btn');
-        submitBtn.disabled = true;
-        submitBtn.textContent = 'Wysyłanie...';
 
         try {
           await api(`/api/articles/${encodeURIComponent(slug)}/talk`, {
@@ -2139,26 +2705,16 @@
           renderTalkView(slug);
         } catch (err) {
           showToast(err.message, 'error');
-          submitBtn.disabled = false;
-          submitBtn.textContent = 'Wyślij wypowiedź';
         }
       });
-
     } catch (err) {
-      updateArticleTabs(null);
-      viewRoot.innerHTML = `
-        <div class="wiki-error">
-          <p>Błąd wczytywania dyskusji: ${escapeHtml(err.message)}</p>
-          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
-        </div>
-      `;
+      viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania dyskusji: ${escapeHtml(err.message)}</div>`;
     }
   }
 
   // --- WIDOK 6: Historia i Diff (#/wiki/:slug/history) ---
   async function renderHistoryView(slug) {
     const viewRoot = document.getElementById('view-root');
-    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie historii wersji...</div>';
 
     try {
@@ -2166,8 +2722,9 @@
       const revisions = data.revisions || [];
       const art = data.article || { title: slug, slug };
 
-      setPageTitle(`Historia zmian: ${art.title}`);
       updateArticleTabs(slug, 'history', revisions.length);
+
+      const canCompare = revisions.length >= 2;
 
       viewRoot.innerHTML = `
         <div class="history-page">
@@ -2179,39 +2736,52 @@
           ${revisions.length === 0 ? `
             <p>Brak zarejestrowanych wersji dla tego artykułu.</p>
           ` : `
-            <div class="history-controls">
-              <button type="button" id="compare-diff-btn" class="btn btn-secondary">🔍 Porównaj wybrane wersje</button>
-            </div>
+            ${canCompare ? `
+              <div class="history-controls">
+                <button type="button" id="compare-diff-btn" class="btn btn-secondary">🔍 Porównaj wybrane wersje</button>
+              </div>
+            ` : `
+              <div class="alert alert-info">
+                ℹ️ Artykuł posiada obecnie tylko jedną zapisaną wersję — porównanie zmian będzie dostępne po dodaniu kolejnej rewizji.
+              </div>
+            `}
 
-            <!-- Kontener na wynik porównania diff -->
-            <div id="diff-output-container" class="diff-container hidden" aria-live="polite"></div>
+            <div id="diff-output-container" class="diff-container hidden"></div>
 
-            <div class="revision-list">
-              ${revisions.map((rev, idx) => `
-                <div class="revision-item ${idx === 0 ? 'current' : ''}" data-id="${rev.id}">
-                  <div class="revision-meta">
-                    <div class="revision-radios">
-                      <label title="Wersja bazowa (od)"><input type="radio" name="diff-from" value="${rev.id}" ${idx === 1 ? 'checked' : ''} aria-label="Porównaj od wersji #${rev.id}" /></label>
-                      <label title="Wersja porównywana (do)"><input type="radio" name="diff-to" value="${rev.id}" ${idx === 0 ? 'checked' : ''} aria-label="Porównaj do wersji #${rev.id}" /></label>
-                    </div>
-                    <span class="revision-date"><strong>${formatDate(rev.created_at)}</strong></span>
-                    <span class="revision-author">${escapeHtml(rev.editor || 'Anonim')}</span>
-                    <span class="revision-comment">${escapeHtml(rev.edit_comment ? `„${rev.edit_comment}”` : '(brak komentarza)')}</span>
-                    ${idx === 0 ? '<span class="status-pill draft" style="font-size:0.75rem;">Aktualna</span>' : ''}
-                  </div>
-                  <div class="revision-actions">
-                    ${(canEditWiki() && idx > 0) ? `
-                      <button type="button" class="btn btn-sm btn-outline revert-btn" data-id="${rev.id}" data-comment="${escapeHtml(rev.edit_comment || '')}">⏪ Przywróć</button>
-                    ` : ''}
-                  </div>
-                </div>
-              `).join('')}
+            <div class="revision-list table-responsive">
+              <table class="wiki-table history-table">
+                <thead>
+                  <tr>
+                    <th style="width: 44px;">Od</th>
+                    <th style="width: 44px;">Do</th>
+                    <th>Data i godzina</th>
+                    <th>Autor edycji</th>
+                    <th>Komentarz do edycji</th>
+                    ${canEditWiki() ? '<th>Akcje</th>' : ''}
+                  </tr>
+                </thead>
+                <tbody>
+                  ${revisions.map((rev, idx) => `
+                    <tr class="revision-row" data-id="${rev.id}">
+                      <td><input type="radio" name="diff-from" value="${rev.id}" aria-label="Wersja bazowa ${rev.id}" ${idx === 1 ? 'checked' : ''} ${!canCompare ? 'disabled' : ''} /></td>
+                      <td><input type="radio" name="diff-to" value="${rev.id}" aria-label="Wersja docelowa ${rev.id}" ${idx === 0 ? 'checked' : ''} ${!canCompare ? 'disabled' : ''} /></td>
+                      <td><strong>${formatDate(rev.created_at)}</strong></td>
+                      <td>${escapeHtml(rev.editor || 'Anonim')}</td>
+                      <td><em>${escapeHtml(rev.edit_comment || '(brak komentarza)')}</em></td>
+                      ${canEditWiki() ? `
+                        <td>
+                          <button type="button" class="btn btn-sm btn-outline revert-btn" data-id="${rev.id}" ${idx === 0 ? 'disabled title="To jest bieżąca wersja"' : ''}>⏪ Przywróć</button>
+                        </td>
+                      ` : ''}
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
             </div>
           `}
         </div>
       `;
 
-      // Obsługa przycisku porównania diff
       const compareBtn = document.getElementById('compare-diff-btn');
       if (compareBtn) {
         compareBtn.addEventListener('click', async () => {
@@ -2219,7 +2789,7 @@
           const toInput = document.querySelector('input[name="diff-to"]:checked');
 
           if (!fromInput || !toInput) {
-            showToast('Wybierz dwie wersje do porównania', 'warning');
+            showToast('Wybierz dwie wersje do porównania.', 'warning');
             return;
           }
 
@@ -2227,7 +2797,7 @@
           const toId = toInput.value;
 
           if (fromId === toId) {
-            showToast('Wybierz dwie różne wersje do porównania', 'warning');
+            showToast('Wybierz dwie różne wersje do porównania.', 'warning');
             return;
           }
 
@@ -2245,41 +2815,36 @@
         });
       }
 
-      // Obsługa przycisków przywracania rewizji
       document.querySelectorAll('.revert-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
           const revId = btn.dataset.id;
-          if (!confirm(`Czy na pewno chcesz przywrócić artykuł do wersji #${revId}?`)) {
-            return;
-          }
+          const confirmed = await showConfirmModal({
+            title: 'Przywrócenie wersji artykułu',
+            message: `Czy na pewno chcesz przywrócić artykuł do wersji #${revId}? Spowoduje to utworzenie nowej rewizji z treścią z wybranej wersji.`,
+            confirmText: 'Przywróć wersję',
+            cancelText: 'Anuluj'
+          });
+          if (!confirmed) return;
 
-          btn.disabled = true;
           try {
             await api(`/api/articles/${encodeURIComponent(slug)}/revert`, {
               method: 'POST',
               body: { revisionId: revId }
             });
-            showToast('Artykuł został pomyślnie przywrócony!', 'success');
-            window.location.hash = `#/wiki/${encodeURIComponent(slug)}`;
+            await refreshBootstrapMetadata();
+            showToast('Artykuł został przywrócony do wybranej wersji!', 'success');
+            window.location.hash = `#/wiki/${slug}`;
           } catch (err) {
-            btn.disabled = false;
             showToast(err.message, 'error');
           }
         });
       });
-
     } catch (err) {
-      updateArticleTabs(null);
-      viewRoot.innerHTML = `
-        <div class="wiki-error">
-          <p>Błąd wczytywania historii: ${escapeHtml(err.message)}</p>
-          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
-        </div>
-      `;
+      viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania historii: ${escapeHtml(err.message)}</div>`;
     }
   }
 
-  // Pomocnik renderowania tabeli Diff
+  // Pomocnik renderowania tabeli Diff z numerami linii
   function renderDiffTable(container, diffData) {
     const fromRev = diffData.fromRev || {};
     const toRev = diffData.toRev || {};
@@ -2297,9 +2862,14 @@
         sign = '-';
       }
 
+      const oldNum = item.oldLineNum !== undefined && item.oldLineNum !== null ? item.oldLineNum : '';
+      const newNum = item.newLineNum !== undefined && item.newLineNum !== null ? item.newLineNum : '';
+
       diffLinesHtml += `
         <tr class="${lineClass}">
-          <td class="diff-sign" aria-hidden="true">${sign}</td>
+          <td class="diff-num">${oldNum}</td>
+          <td class="diff-num">${newNum}</td>
+          <td class="diff-sign">${sign}</td>
           <td class="diff-code"><pre>${escapeHtml(item.line || '')}</pre></td>
         </tr>
       `;
@@ -2307,191 +2877,221 @@
 
     container.innerHTML = `
       <div class="diff-box">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-          <h3>Porównanie wersji</h3>
-          <button type="button" id="diff-close-btn" class="btn btn-sm btn-outline">Zamknij diff &times;</button>
-        </div>
         <div class="diff-header-info">
           <div class="diff-ver-box">
-            <strong>Wersja bazowa (#${fromRev.id || '?'}):</strong> ${formatDate(fromRev.created_at)} przez <em>${escapeHtml(fromRev.editor || 'Anonim')}</em>
+            <strong>Wersja bazowa (#${fromRev.id}):</strong> ${formatDate(fromRev.created_at)} przez <em>${escapeHtml(fromRev.editor || 'Anonim')}</em>
           </div>
           <div class="diff-ver-box">
-            <strong>Wersja porównywana (#${toRev.id || '?'}):</strong> ${formatDate(toRev.created_at)} przez <em>${escapeHtml(toRev.editor || 'Anonim')}</em>
+            <strong>Wersja porównywana (#${toRev.id}):</strong> ${formatDate(toRev.created_at)} przez <em>${escapeHtml(toRev.editor || 'Anonim')}</em>
           </div>
         </div>
         <table class="diff-table">
           <tbody>
-            ${diffLinesHtml || '<tr><td colspan="2">Brak różnic w tekście.</td></tr>'}
+            ${diffLinesHtml || '<tr><td colspan="4">Brak różnic w tekście.</td></tr>'}
           </tbody>
         </table>
       </div>
     `;
-
-    document.getElementById('diff-close-btn')?.addEventListener('click', () => {
-      container.classList.add('hidden');
-    });
   }
 
-  // --- WIDOK 7: Katalog Artykułów (#/articles) z obsługą FTS ---
-  async function renderArticlesCatalog(query = '', selectedCategory = '') {
+  // --- WIDOK 7: Katalog Artykułów (#/articles) ---
+  async function renderArticlesCatalog(query = '', selectedCategory = '', initialSort = 'featured') {
     updateArticleTabs(null);
-    setPageTitle('Indeks artykułów');
     const viewRoot = document.getElementById('view-root');
-    viewRoot.classList.add('view-fade-in');
-    viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie katalogu artykułów...</div>';
 
-    try {
-      let articles = [];
-      if (query && !selectedCategory) {
-        // Używamy zaawansowanego endpointu FTS5
-        const searchData = await api(`/api/search?q=${encodeURIComponent(query)}`).catch(() => null);
-        if (searchData && (searchData.articles || searchData.results)) {
-          articles = searchData.articles || searchData.results;
-        } else {
-          const fallbackData = await api(`/api/articles?includeUnpublished=1&q=${encodeURIComponent(query)}`);
-          articles = fallbackData.articles || [];
-        }
-      } else {
-        const qParam = query ? `&q=${encodeURIComponent(query)}` : '';
-        const catParam = selectedCategory ? `&category=${encodeURIComponent(selectedCategory)}` : '';
-        const data = await api(`/api/articles?includeUnpublished=1${qParam}${catParam}`);
-        articles = data.articles || [];
-      }
-
-      viewRoot.innerHTML = `
-        <div class="articles-catalog-page">
-          <header class="catalog-header">
-            <div class="catalog-header-row">
-              <div>
-                <h1>Indeks artykułów</h1>
-                <p>Spis haseł encyklopedycznych z pełnotekstowym wyszukiwaniem i filtrowaniem działów.</p>
-              </div>
-              ${canEditWiki() ? '<a href="#/new" class="catalog-create-link btn btn-primary btn-sm">+ Utwórz nowe hasło</a>' : ''}
+    viewRoot.innerHTML = `
+      <div class="articles-catalog-page">
+        <header class="catalog-header">
+          <div class="catalog-header-row">
+            <div>
+              <h1>Indeks artykułów</h1>
+              <p>Spis haseł encyklopedycznych z filtrowaniem według nazwy, działu i kolejności.</p>
             </div>
-          </header>
-
-          <div class="catalog-filter-bar">
-            <div class="filter-group">
-              <label for="catalog-search-input">Szukaj w indeksie:</label>
-              <input type="text" id="catalog-search-input" class="form-control" value="${escapeHtml(query)}" placeholder="Wpisz frazę..." />
-            </div>
-            <div class="filter-group">
-              <label for="catalog-category-select">Dział tematyczny:</label>
-              <select id="catalog-category-select" class="form-control">
-                <option value="">Wszystkie kategorie</option>
-                ${state.categories.map(c => {
-                  const name = getCatName(c);
-                  const count = getCatCount(c);
-                  return `<option value="${escapeHtml(name)}" ${name === selectedCategory ? 'selected' : ''}>${escapeHtml(name)}${count !== null ? ` (${count})` : ''}</option>`;
-                }).join('')}
-              </select>
-            </div>
-            <button id="catalog-filter-btn" type="button" class="btn btn-secondary">Filtruj</button>
-            ${(query || selectedCategory) ? '<button id="catalog-reset-btn" type="button" class="btn btn-outline">Wyczyść filtry</button>' : ''}
+            ${canEditWiki() ? '<a href="#/new" class="catalog-create-link">+ Utwórz nowe hasło</a>' : ''}
           </div>
+        </header>
 
-          <div class="catalog-results-info">
-            Liczba haseł: <strong>${articles.length}</strong>
+        <div class="catalog-filter-bar">
+          <div class="filter-group">
+            <label for="catalog-search-input">Szukaj w indeksie:</label>
+            <input type="text" id="catalog-search-input" class="form-control" value="${escapeHtml(query)}" placeholder="Wpisz frazę..." />
           </div>
-
-          <div class="catalog-articles-grid">
-            ${articles.length === 0 ? `
-              <div class="catalog-empty">
-                <p>Nie znaleziono żadnych artykułów spełniających podane kryteria.</p>
-                ${(query && canEditWiki()) ? `
-                  <p><a href="#/new?title=${encodeURIComponent(query)}" class="btn btn-primary btn-sm">➕ Utwórz hasło: „${escapeHtml(query)}”</a></p>
-                ` : ''}
-              </div>
-            ` : articles.map(art => {
-              const cats = parseCategories(art.categories);
-              const summaryHtml = art.snippet
-                ? renderSearchSnippet(art.snippet)
-                : escapeHtml(art.summary || 'Brak podsumowania.');
-
-              return `
-                <article class="catalog-article-card">
-                  <div class="catalog-card-main">
-                    <div class="catalog-card-header">
-                      <h3><a href="#/wiki/${encodeURIComponent(art.slug)}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></h3>
-                      <div class="catalog-card-badges">
-                        ${art.is_featured ? '<span class="catalog-tag catalog-tag-featured">★ Wyróżniony</span>' : ''}
-                        ${art.is_locked ? '<span class="catalog-tag">Zabezpieczony</span>' : ''}
-                        ${!art.is_published ? '<span class="catalog-tag catalog-tag-draft">Szkic</span>' : ''}
-                      </div>
-                    </div>
-                    <p class="catalog-card-summary">${summaryHtml}</p>
-                    <div class="catalog-card-footer">
-                      ${cats && cats.length > 0 ? `
-                        <div class="catalog-card-cats">
-                          <span class="catalog-cats-label">Kategorie:</span>
-                          ${cats.map(cName => `
-                            <a href="#/categories/${encodeURIComponent(cName)}" class="badge-cat">${escapeHtml(cName)}</a>
-                          `).join('<span class="catalog-sep">·</span>')}
-                        </div>
-                      ` : '<span></span>'}
-                      <div class="catalog-card-meta">
-                        <span>${art.views || 0} wyśw.</span>
-                        <span class="catalog-sep">·</span>
-                        <span>${formatDate(art.updated_at || art.created_at)}</span>
-                      </div>
-                    </div>
-                  </div>
-                </article>
-              `;
-            }).join('')}
+          <div class="filter-group">
+            <label for="catalog-category-select">Dział tematyczny:</label>
+            <select id="catalog-category-select" class="form-control">
+              <option value="">Wszystkie kategorie</option>
+              ${state.categories.map(c => {
+                const name = getCatName(c);
+                const count = getCatCount(c);
+                return `<option value="${escapeHtml(name)}" ${name === selectedCategory ? 'selected' : ''}>${escapeHtml(name)}${count !== null ? ` (${count})` : ''}</option>`;
+              }).join('')}
+            </select>
+          </div>
+          <div class="filter-group">
+            <label for="catalog-sort-select">Sortowanie:</label>
+            <select id="catalog-sort-select" class="form-control">
+              <option value="featured" ${initialSort === 'featured' ? 'selected' : ''}>Wyróżnione i najnowsze</option>
+              <option value="updated" ${initialSort === 'updated' ? 'selected' : ''}>Ostatnio zmieniane</option>
+              <option value="views" ${initialSort === 'views' ? 'selected' : ''}>Najpopularniejsze</option>
+              <option value="title-asc" ${initialSort === 'title-asc' ? 'selected' : ''}>Alfabetycznie (A–Z)</option>
+              <option value="title-desc" ${initialSort === 'title-desc' ? 'selected' : ''}>Alfabetycznie (Z–A)</option>
+            </select>
+          </div>
+          <div class="catalog-filter-actions">
+            <button id="catalog-filter-btn" type="button" class="btn btn-primary">Filtruj</button>
+            <button id="catalog-clear-btn" type="button" class="btn btn-outline ${(!query && !selectedCategory && initialSort === 'featured') ? 'hidden' : ''}">Wyczyść</button>
           </div>
         </div>
-      `;
 
-      // Eventy filtracji
-      const filterBtn = document.getElementById('catalog-filter-btn');
-      const resetBtn = document.getElementById('catalog-reset-btn');
-      const searchInput = document.getElementById('catalog-search-input');
-      const categorySelect = document.getElementById('catalog-category-select');
-
-      const triggerFilter = () => {
-        const q = searchInput.value.trim();
-        const cat = categorySelect.value;
-        const params = new URLSearchParams();
-        if (q) params.set('q', q);
-        if (cat) params.set('category', cat);
-        const queryStr = params.toString() ? '?' + params.toString() : '';
-        window.location.hash = `#/articles${queryStr}`;
-      };
-
-      filterBtn.addEventListener('click', triggerFilter);
-      searchInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') triggerFilter();
-      });
-      categorySelect.addEventListener('change', triggerFilter);
-      if (resetBtn) {
-        resetBtn.addEventListener('click', () => {
-          window.location.hash = '#/articles';
-        });
-      }
-
-    } catch (err) {
-      viewRoot.innerHTML = `
-        <div class="wiki-error">
-          <p>Błąd wczytywania katalogu: ${escapeHtml(err.message)}</p>
-          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
+        <div id="catalog-results-info" class="catalog-results-info">Ładowanie...</div>
+        <div id="catalog-results-grid" class="catalog-articles-grid">
+          <div class="wiki-loading">Ładowanie katalogu artykułów...</div>
         </div>
-      `;
+      </div>
+    `;
+
+    const searchInput = document.getElementById('catalog-search-input');
+    const categorySelect = document.getElementById('catalog-category-select');
+    const sortSelect = document.getElementById('catalog-sort-select');
+    const filterBtn = document.getElementById('catalog-filter-btn');
+    const clearBtn = document.getElementById('catalog-clear-btn');
+    const resultsInfoEl = document.getElementById('catalog-results-info');
+    const resultsGridEl = document.getElementById('catalog-results-grid');
+
+    let catalogAbort = null;
+    let catalogReqSeq = 0;
+    let searchDebounce = null;
+
+    function sortCatalogList(list, sortMode) {
+      const copy = [...list];
+      if (sortMode === 'title-asc') {
+        return copy.sort((a, b) => String(a.title || '').localeCompare(String(b.title || ''), 'pl'));
+      }
+      if (sortMode === 'title-desc') {
+        return copy.sort((a, b) => String(b.title || '').localeCompare(String(a.title || ''), 'pl'));
+      }
+      if (sortMode === 'views') {
+        return copy.sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0));
+      }
+      if (sortMode === 'updated') {
+        return copy.sort((a, b) => String(b.updated_at || b.created_at || '').localeCompare(String(a.updated_at || a.created_at || '')));
+      }
+      return copy;
     }
+
+    async function updateCatalogResults() {
+      const q = searchInput.value.trim();
+      const cat = categorySelect.value;
+      const sortMode = sortSelect.value;
+
+      if (clearBtn) {
+        clearBtn.classList.toggle('hidden', !q && !cat && sortMode === 'featured');
+      }
+
+      const params = new URLSearchParams();
+      if (q) params.set('q', q);
+      if (cat) params.set('category', cat);
+      if (sortMode && sortMode !== 'featured') params.set('sort', sortMode);
+      const queryStr = params.toString() ? '?' + params.toString() : '';
+      history.replaceState(null, '', `#/articles${queryStr}`);
+
+      const seq = ++catalogReqSeq;
+      if (catalogAbort) catalogAbort.abort();
+      catalogAbort = new AbortController();
+
+      try {
+        const qParam = q ? `&q=${encodeURIComponent(q)}` : '';
+        const catParam = cat ? `&category=${encodeURIComponent(cat)}` : '';
+        const data = await api(`/api/articles?includeUnpublished=1${qParam}${catParam}`, {
+          signal: catalogAbort.signal
+        });
+        if (seq !== catalogReqSeq) return;
+
+        const articles = sortCatalogList(data.articles || [], sortMode);
+        resultsInfoEl.innerHTML = `Liczba haseł: <strong>${articles.length}</strong>`;
+
+        if (articles.length === 0) {
+          resultsGridEl.innerHTML = `
+            <div class="catalog-empty">
+              <p>Nie znaleziono żadnych artykułów spełniających podane kryteria.</p>
+            </div>
+          `;
+          return;
+        }
+
+        resultsGridEl.innerHTML = articles.map(art => {
+          const cats = parseCategories(art.categories);
+          return `
+            <article class="catalog-article-card">
+              <div class="catalog-card-main">
+                <div class="catalog-card-header">
+                  <h3><a href="#/wiki/${art.slug}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></h3>
+                  <div class="catalog-card-badges">
+                    ${art.is_featured ? '<span class="catalog-tag catalog-tag-featured">★ Wyróżniony</span>' : ''}
+                    ${art.is_locked ? '<span class="catalog-tag">Zabezpieczony</span>' : ''}
+                    ${!art.is_published ? '<span class="catalog-tag catalog-tag-draft">Szkic</span>' : ''}
+                  </div>
+                </div>
+                <p class="catalog-card-summary">${escapeHtml(art.summary || 'Brak podsumowania.')}</p>
+                <div class="catalog-card-footer">
+                  ${cats.length > 0 ? `
+                    <div class="catalog-card-cats">
+                      <span class="catalog-cats-label">Kategorie:</span>
+                      ${cats.map(cName => `<a href="#/categories/${encodeURIComponent(cName)}" class="badge-cat">${escapeHtml(cName)}</a>`).join('<span class="catalog-sep">·</span>')}
+                    </div>
+                  ` : '<span></span>'}
+                  <div class="catalog-card-meta">
+                    <span>${art.views || 0} wyśw.</span>
+                    <span class="catalog-sep">·</span>
+                    <span>${formatDate(art.updated_at || art.created_at)}</span>
+                  </div>
+                </div>
+              </div>
+            </article>
+          `;
+        }).join('');
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+        resultsGridEl.innerHTML = `<div class="wiki-error">Błąd wczytywania katalogu: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    filterBtn.addEventListener('click', updateCatalogResults);
+    searchInput.addEventListener('input', () => {
+      if (searchDebounce) clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(updateCatalogResults, 220);
+    });
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (searchDebounce) clearTimeout(searchDebounce);
+        updateCatalogResults();
+      }
+    });
+    categorySelect.addEventListener('change', updateCatalogResults);
+    sortSelect.addEventListener('change', updateCatalogResults);
+    clearBtn.addEventListener('click', () => {
+      searchInput.value = '';
+      categorySelect.value = '';
+      sortSelect.value = 'featured';
+      updateCatalogResults();
+      searchInput.focus();
+    });
+
+    await updateCatalogResults();
   }
 
   // --- WIDOK 8: Kategorie (#/categories oraz #/categories/:category) ---
   async function renderCategoriesView(selectedCategory = null) {
     updateArticleTabs(null);
     const viewRoot = document.getElementById('view-root');
-    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie kategorii...</div>';
 
     try {
       if (!selectedCategory) {
-        setPageTitle('Kategorie encyklopedii');
         const bootData = await api('/api/bootstrap');
         const cats = bootData.categories || [];
+        state.categories = cats;
 
         viewRoot.innerHTML = `
           <div class="categories-overview-page">
@@ -2501,7 +3101,7 @@
             </header>
 
             <div class="categories-large-grid">
-              ${cats.length === 0 ? '<p>Brak zdefiniowanych kategorii w encyklopedii.</p>' : cats.map(cat => {
+              ${cats.map(cat => {
                 const name = getCatName(cat);
                 const count = getCatCount(cat);
                 const countLabel = count === 1 ? '1 hasło' : `${count || 0} haseł`;
@@ -2516,7 +3116,6 @@
           </div>
         `;
       } else {
-        setPageTitle(`Kategoria: ${selectedCategory}`);
         const data = await api(`/api/articles?category=${encodeURIComponent(selectedCategory)}`);
         const articles = data.articles || [];
 
@@ -2533,58 +3132,41 @@
                 <div class="catalog-empty">
                   <p>Brak opublikowanych artykułów w kategorii <em>${escapeHtml(selectedCategory)}</em>.</p>
                 </div>
-              ` : articles.map(art => {
-                const cats = parseCategories(art.categories);
-                return `
-                  <article class="catalog-article-card">
-                    <div class="catalog-card-main">
-                      <div class="catalog-card-header">
-                        <h3><a href="#/wiki/${encodeURIComponent(art.slug)}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></h3>
-                        <div class="catalog-card-badges">
-                          ${art.is_featured ? '<span class="catalog-tag catalog-tag-featured">★ Wyróżniony</span>' : ''}
-                          ${art.is_locked ? '<span class="catalog-tag">Zabezpieczony</span>' : ''}
-                        </div>
-                      </div>
-                      <p class="catalog-card-summary">${escapeHtml(art.summary || 'Brak podsumowania.')}</p>
-                      <div class="catalog-card-footer">
-                        ${cats && cats.length > 0 ? `
-                          <div class="catalog-card-cats">
-                            <span class="catalog-cats-label">Kategorie:</span>
-                            ${cats.map(cName => `
-                              <a href="#/categories/${encodeURIComponent(cName)}" class="badge-cat">${escapeHtml(cName)}</a>
-                            `).join('<span class="catalog-sep">·</span>')}
-                          </div>
-                        ` : '<span></span>'}
-                        <div class="catalog-card-meta">
-                          <span>${art.views || 0} wyśw.</span>
-                          <span class="catalog-sep">·</span>
-                          <span>${formatDate(art.updated_at || art.created_at)}</span>
-                        </div>
+              ` : articles.map(art => `
+                <article class="catalog-article-card">
+                  <div class="catalog-card-main">
+                    <div class="catalog-card-header">
+                      <h3><a href="#/wiki/${art.slug}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></h3>
+                      <div class="catalog-card-badges">
+                        ${art.is_featured ? '<span class="catalog-tag catalog-tag-featured">★ Wyróżniony</span>' : ''}
+                        ${art.is_locked ? '<span class="catalog-tag">Zabezpieczony</span>' : ''}
                       </div>
                     </div>
-                  </article>
-                `;
-              }).join('')}
+                    <p class="catalog-card-summary">${escapeHtml(art.summary || 'Brak podsumowania.')}</p>
+                    <div class="catalog-card-footer">
+                      <span></span>
+                      <div class="catalog-card-meta">
+                        <span>${art.views || 0} wyśw.</span>
+                        <span class="catalog-sep">·</span>
+                        <span>${formatDate(art.updated_at || art.created_at)}</span>
+                      </div>
+                    </div>
+                  </div>
+                </article>
+              `).join('')}
             </div>
           </div>
         `;
       }
     } catch (err) {
-      viewRoot.innerHTML = `
-        <div class="wiki-error">
-          <p>Błąd wczytywania kategorii: ${escapeHtml(err.message)}</p>
-          <a href="#/categories" class="btn btn-secondary">&larr; Wszystkie kategorie</a>
-        </div>
-      `;
+      viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania kategorii: ${escapeHtml(err.message)}</div>`;
     }
   }
 
   // --- WIDOK 9: Ostatnie Zmiany (#/recent-changes) ---
   async function renderRecentChangesView() {
     updateArticleTabs(null);
-    setPageTitle('Ostatnie zmiany');
     const viewRoot = document.getElementById('view-root');
-    viewRoot.classList.add('view-fade-in');
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie ostatnich zmian...</div>';
 
     try {
@@ -2608,12 +3190,12 @@
                 <div class="recent-change-row">
                   <div class="change-time">${formatDate(ch.created_at)}</div>
                   <div class="change-main">
-                    <span class="change-art-title"><a href="#/wiki/${encodeURIComponent(slug)}">${escapeHtml(title)}</a></span>
+                    <span class="change-art-title"><a href="#/wiki/${slug}">${escapeHtml(title)}</a></span>
                     <span class="change-author">przez <strong>${escapeHtml(ch.editor || 'Anonim')}</strong></span>
                     <div class="change-comment"><em>„${escapeHtml(ch.edit_comment || 'Aktualizacja treści')}”</em></div>
                   </div>
                   <div class="change-links">
-                    <a href="#/wiki/${encodeURIComponent(slug)}/history" class="btn btn-sm btn-outline">Historia</a>
+                    <a href="#/wiki/${slug}/history" class="btn btn-sm btn-outline">Historia</a>
                   </div>
                 </div>
               `;
@@ -2622,34 +3204,25 @@
         </div>
       `;
     } catch (err) {
-      viewRoot.innerHTML = `
-        <div class="wiki-error">
-          <p>Błąd wczytywania ostatnich zmian: ${escapeHtml(err.message)}</p>
-          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
-        </div>
-      `;
+      viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania ostatnich zmian: ${escapeHtml(err.message)}</div>`;
     }
   }
 
   // --- WIDOK 10: Panel Administracyjny (#/panel) ---
   async function renderAdminPanel() {
     updateArticleTabs(null);
-    setPageTitle('Panel administracyjny');
     const viewRoot = document.getElementById('view-root');
-    viewRoot.classList.add('view-fade-in');
 
-    // Sprawdzenie czy użytkownik to admin
     if (!state.currentUser || state.currentUser.role !== 'admin') {
       viewRoot.innerHTML = `
         <div class="admin-auth-guard">
-          <h2>🔒 Wymagane logowanie administratora</h2>
-          <p>Ta strona jest dostępna wyłącznie dla uprawnionych administratorów witryny.</p>
+          <h2>🔒 Wymagane logowanie</h2>
+          <p>Ta strona jest dostępna wyłącznie dla uprawnionych użytkowników.</p>
           ${state.currentUser
-            ? '<p>Twoje konto nie posiada roli administratora.</p>'
+            ? '<p>Twoje konto nie ma wymaganych uprawnień.</p>'
             : '<button type="button" id="admin-page-login" class="btn btn-primary">Zaloguj się</button>'}
         </div>
       `;
-
       document.getElementById('admin-page-login')?.addEventListener('click', () => openAuthModal('login'));
       return;
     }
@@ -2665,7 +3238,6 @@
       const auditLogs = data.recentAuditLogs || [];
       const talkMessages = data.recentTalkMessages || [];
 
-      // Render struktury panelu
       viewRoot.innerHTML = `
         <div class="admin-dashboard">
           <header class="admin-header">
@@ -2676,31 +3248,26 @@
             <p class="admin-lead">Zarządzanie hasłami, uprawnieniami kont, dyskusjami, konfiguracją witryny oraz dziennikiem zdarzeń.</p>
           </header>
 
-          <!-- Pasek zakładek panelu admina -->
-          <nav class="admin-tabs" role="tablist" aria-label="Kategorie panelu">
-            <button class="admin-tab-btn ${state.adminActiveTab === 'kpi' ? 'active' : ''}" data-tab="kpi" role="tab">Podsumowanie</button>
-            <button class="admin-tab-btn ${state.adminActiveTab === 'articles' ? 'active' : ''}" data-tab="articles" role="tab">Artykuły (${articles.length})</button>
-            <button class="admin-tab-btn ${state.adminActiveTab === 'users' ? 'active' : ''}" data-tab="users" role="tab">Użytkownicy (${users.length})</button>
-            <button class="admin-tab-btn ${state.adminActiveTab === 'talk' ? 'active' : ''}" data-tab="talk" role="tab">Dyskusje (${talkMessages.length})</button>
-            <button class="admin-tab-btn ${state.adminActiveTab === 'settings' ? 'active' : ''}" data-tab="settings" role="tab">Ustawienia</button>
-            <button class="admin-tab-btn ${state.adminActiveTab === 'audit' ? 'active' : ''}" data-tab="audit" role="tab">Dziennik zdarzeń</button>
+          <nav class="admin-tabs" role="tablist" aria-label="Zakładki panelu administratora">
+            <button type="button" role="tab" aria-selected="${state.adminActiveTab === 'kpi'}" class="admin-tab-btn ${state.adminActiveTab === 'kpi' ? 'active' : ''}" data-tab="kpi">Podsumowanie</button>
+            <button type="button" role="tab" aria-selected="${state.adminActiveTab === 'articles'}" class="admin-tab-btn ${state.adminActiveTab === 'articles' ? 'active' : ''}" data-tab="articles">Artykuły (${articles.length})</button>
+            <button type="button" role="tab" aria-selected="${state.adminActiveTab === 'users'}" class="admin-tab-btn ${state.adminActiveTab === 'users' ? 'active' : ''}" data-tab="users">Użytkownicy (${users.length})</button>
+            <button type="button" role="tab" aria-selected="${state.adminActiveTab === 'talk'}" class="admin-tab-btn ${state.adminActiveTab === 'talk' ? 'active' : ''}" data-tab="talk">Dyskusje (${talkMessages.length})</button>
+            <button type="button" role="tab" aria-selected="${state.adminActiveTab === 'settings'}" class="admin-tab-btn ${state.adminActiveTab === 'settings' ? 'active' : ''}" data-tab="settings">Ustawienia</button>
+            <button type="button" role="tab" aria-selected="${state.adminActiveTab === 'audit'}" class="admin-tab-btn ${state.adminActiveTab === 'audit' ? 'active' : ''}" data-tab="audit">Dziennik zdarzeń</button>
           </nav>
 
-          <!-- Zawartość zakładek -->
-          <div id="admin-tab-content" class="admin-tab-content" aria-live="polite"></div>
+          <div id="admin-tab-content" class="admin-tab-content"></div>
         </div>
       `;
 
       const tabContent = document.getElementById('admin-tab-content');
 
-      // Funkcja renderująca wybraną podzakładkę
       const renderCurrentAdminSubTab = () => {
         document.querySelectorAll('.admin-tab-btn').forEach(btn => {
-          if (btn.dataset.tab === state.adminActiveTab) {
-            btn.classList.add('active');
-          } else {
-            btn.classList.remove('active');
-          }
+          const isActive = btn.dataset.tab === state.adminActiveTab;
+          btn.classList.toggle('active', isActive);
+          btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
         });
 
         if (state.adminActiveTab === 'kpi') {
@@ -2728,9 +3295,9 @@
               <p>Szybkie przejście do najczęstszych zadań redakcyjnych i konfiguracyjnych:</p>
               <div class="quick-admin-links">
                 <a href="#/new" class="btn btn-primary">+ Utwórz nowy artykuł</a>
-                <button type="button" class="btn btn-secondary switch-to-tab" data-target="articles">Zarządzaj artykułami i wyróżnieniami</button>
-                <button type="button" class="btn btn-secondary switch-to-tab" data-target="users">Zarządzaj kontami i rolami</button>
-                <button type="button" class="btn btn-secondary switch-to-tab" data-target="settings">Konfiguracja witryny</button>
+                <button type="button" class="btn switch-to-tab" data-target="articles">Zarządzaj artykułami i wyróżnieniami</button>
+                <button type="button" class="btn switch-to-tab" data-target="users">Zarządzaj kontami i rolami</button>
+                <button type="button" class="btn switch-to-tab" data-target="settings">Konfiguracja witryny</button>
               </div>
             </div>
           `;
@@ -2744,7 +3311,7 @@
         } else if (state.adminActiveTab === 'articles') {
           tabContent.innerHTML = `
             <div class="admin-section">
-              <div class="admin-section-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+              <div class="admin-section-header">
                 <h2>Zarządzanie artykułami (${articles.length})</h2>
                 <a href="#/new" class="btn btn-primary btn-sm">➕ Utwórz artykuł</a>
               </div>
@@ -2762,7 +3329,7 @@
                   <tbody>
                     ${articles.map(art => `
                       <tr data-slug="${art.slug}">
-                        <td><strong><a href="#/wiki/${encodeURIComponent(art.slug)}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></strong></td>
+                        <td><strong><a href="#/wiki/${art.slug}">${art.is_featured ? '<span class="featured-star" title="Artykuł wyróżniony">★</span> ' : ''}${escapeHtml(art.title)}</a></strong></td>
                         <td>${art.views || 0}</td>
                         <td>
                           <div class="admin-status-group">
@@ -2786,7 +3353,7 @@
                         </td>
                         <td>
                           <div class="admin-btn-group">
-                            <a href="#/wiki/${encodeURIComponent(art.slug)}/edit" class="btn btn-sm btn-secondary">Edytuj</a>
+                            <a href="#/wiki/${art.slug}/edit" class="btn btn-sm">Edytuj</a>
                             <button type="button" class="btn btn-sm btn-danger delete-article-btn" data-slug="${art.slug}" data-title="${escapeHtml(art.title)}">Usuń</button>
                           </div>
                         </td>
@@ -2798,12 +3365,10 @@
             </div>
           `;
 
-          // Handlery artykułów
           tabContent.querySelectorAll('.toggle-lock-btn').forEach(btn => {
             btn.addEventListener('click', async () => {
               const slug = btn.dataset.slug;
               const isLocked = btn.dataset.status === '1';
-              btn.disabled = true;
               try {
                 await api(`/api/admin/articles/${encodeURIComponent(slug)}/status`, {
                   method: 'PATCH',
@@ -2812,7 +3377,6 @@
                 showToast(`Zmieniono status blokady dla: ${slug}`, 'success');
                 renderAdminPanel();
               } catch (err) {
-                btn.disabled = false;
                 showToast(err.message, 'error');
               }
             });
@@ -2822,7 +3386,6 @@
             btn.addEventListener('click', async () => {
               const slug = btn.dataset.slug;
               const isFeatured = btn.dataset.status === '1';
-              btn.disabled = true;
               try {
                 await api(`/api/admin/articles/${encodeURIComponent(slug)}/status`, {
                   method: 'PATCH',
@@ -2831,7 +3394,6 @@
                 showToast(`Zaktualizowano wyróżnienie artykułu: ${slug}`, 'success');
                 renderAdminPanel();
               } catch (err) {
-                btn.disabled = false;
                 showToast(err.message, 'error');
               }
             });
@@ -2841,16 +3403,15 @@
             btn.addEventListener('click', async () => {
               const slug = btn.dataset.slug;
               const isPublished = btn.dataset.status === '1';
-              btn.disabled = true;
               try {
                 await api(`/api/admin/articles/${encodeURIComponent(slug)}/status`, {
                   method: 'PATCH',
                   body: { is_published: !isPublished }
                 });
+                await refreshBootstrapMetadata();
                 showToast(`Zmieniono widoczność artykułu: ${slug}`, 'success');
                 renderAdminPanel();
               } catch (err) {
-                btn.disabled = false;
                 showToast(err.message, 'error');
               }
             });
@@ -2860,23 +3421,27 @@
             btn.addEventListener('click', async () => {
               const slug = btn.dataset.slug;
               const title = btn.dataset.title;
-              if (!confirm(`Czy na pewno chcesz BEZPOWROTNIE usunąć artykuł „${title}”?`)) {
-                return;
-              }
-              btn.disabled = true;
+              const confirmed = await showConfirmModal({
+                title: 'Usunięcie artykułu',
+                message: `Czy na pewno chcesz BEZPOWROTNIE usunąć artykuł „${title}”? Tej operacji nie można cofnąć.`,
+                confirmText: 'Usuń artykuł',
+                cancelText: 'Anuluj',
+                danger: true
+              });
+              if (!confirmed) return;
+
               try {
                 await api(`/api/admin/articles/${encodeURIComponent(slug)}`, {
                   method: 'DELETE'
                 });
-                showToast(`Artykuł „${title}” został usunięty`, 'success');
+                await refreshBootstrapMetadata();
+                showToast(`Artykuł „${title}” został usunięty.`, 'success');
                 renderAdminPanel();
               } catch (err) {
-                btn.disabled = false;
                 showToast(err.message, 'error');
               }
             });
           });
-
         } else if (state.adminActiveTab === 'users') {
           tabContent.innerHTML = `
             <div class="admin-section">
@@ -2897,12 +3462,13 @@
                       <tr data-id="${u.id}">
                         <td>#${u.id}</td>
                         <td><strong>${escapeHtml(u.username)}</strong></td>
-                        <td><span class="user-role-pill role-${u.role}">${escapeHtml(u.role)}</span></td>
+                        <td><span class="user-role-pill role-${escapeHtml(u.role)}">${escapeHtml(u.role)}</span></td>
                         <td><em>${escapeHtml(u.bio || '')}</em></td>
                         <td>
                           <select class="form-control role-select" data-id="${u.id}" ${u.id === (state.currentUser ? state.currentUser.id : null) ? 'disabled title="Nie możesz zmienić własnej roli"' : ''}>
-                            <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>Administrator (admin)</option>
+                            <option value="user" ${u.role === 'user' ? 'selected' : ''}>Użytkownik (user)</option>
                             <option value="editor" ${u.role === 'editor' ? 'selected' : ''}>Redaktor (editor)</option>
+                            <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>Administrator (admin)</option>
                             <option value="blocked" ${u.role === 'blocked' ? 'selected' : ''}>Zablokowany (blocked)</option>
                           </select>
                         </td>
@@ -2912,22 +3478,22 @@
                 </table>
               </div>
 
-              <!-- Formularz dodawania nowego użytkownika -->
-              <div class="admin-subcard add-user-card" style="margin-top:24px;">
+              <div class="admin-subcard add-user-card">
                 <h3>➕ Utwórz nowe konto użytkownika</h3>
                 <form id="admin-add-user-form" class="admin-form-grid">
                   <div class="form-group">
-                    <label for="new-user-username">Nazwa użytkownika: <span class="required">*</span></label>
-                    <input type="text" id="new-user-username" class="form-control" placeholder="Login (min. 2 znaki)" required autocomplete="off" />
+                    <label for="new-user-username">Nazwa użytkownika:</label>
+                    <input type="text" id="new-user-username" class="form-control" placeholder="Login" required />
                   </div>
                   <div class="form-group">
-                    <label for="new-user-password">Hasło: <span class="required">*</span></label>
-                    <input type="password" id="new-user-password" class="form-control" placeholder="Hasło (min. 3 znaki)" required autocomplete="new-password" />
+                    <label for="new-user-password">Hasło:</label>
+                    <input type="password" id="new-user-password" class="form-control" placeholder="Hasło (min. 3 znaki)" minlength="3" required />
                   </div>
                   <div class="form-group">
                     <label for="new-user-role">Rola:</label>
                     <select id="new-user-role" class="form-control">
-                      <option value="editor">Redaktor (editor)</option>
+                      <option value="user">Użytkownik (user)</option>
+                      <option value="editor" selected>Redaktor (editor)</option>
                       <option value="admin">Administrator (admin)</option>
                       <option value="blocked">Zablokowany (blocked)</option>
                     </select>
@@ -2937,55 +3503,42 @@
                     <input type="text" id="new-user-bio" class="form-control" placeholder="Krótki opis konta" />
                   </div>
                   <div class="form-actions" style="grid-column: 1 / -1;">
-                    <button type="submit" id="admin-add-user-submit" class="btn btn-primary">Utwórz użytkownika</button>
+                    <button type="submit" class="btn btn-primary">Utwórz użytkownika</button>
                   </div>
                 </form>
               </div>
             </div>
           `;
 
-          // Handlery ról
           tabContent.querySelectorAll('.role-select').forEach(sel => {
             sel.addEventListener('change', async () => {
               const userId = sel.dataset.id;
               const newRole = sel.value;
-              sel.disabled = true;
               try {
                 await api(`/api/admin/users/${userId}`, {
                   method: 'PATCH',
                   body: { role: newRole }
                 });
+                const row = sel.closest('tr');
+                const pill = row?.querySelector('.user-role-pill');
+                if (pill) {
+                  pill.className = `user-role-pill role-${newRole}`;
+                  pill.textContent = newRole;
+                }
                 showToast(`Zaktualizowano rolę użytkownika #${userId} na: ${newRole}`, 'success');
-                renderAdminPanel();
               } catch (err) {
-                sel.disabled = false;
                 showToast(err.message, 'error');
                 renderAdminPanel();
               }
             });
           });
 
-          // Dodawanie użytkownika
-          const addUserForm = document.getElementById('admin-add-user-form');
-          addUserForm.addEventListener('submit', async (e) => {
+          document.getElementById('admin-add-user-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const username = document.getElementById('new-user-username').value.trim();
             const password = document.getElementById('new-user-password').value;
             const role = document.getElementById('new-user-role').value;
             const bio = document.getElementById('new-user-bio').value.trim();
-
-            if (!username || username.length < 2) {
-              showToast('Nazwa użytkownika musi mieć co najmniej 2 znaki', 'warning');
-              return;
-            }
-            if (!password || password.length < 3) {
-              showToast('Hasło musi mieć co najmniej 3 znaki', 'warning');
-              return;
-            }
-
-            const submitBtn = document.getElementById('admin-add-user-submit');
-            submitBtn.disabled = true;
-            submitBtn.textContent = 'Tworzenie...';
 
             try {
               await api('/api/admin/users', {
@@ -2995,12 +3548,9 @@
               showToast(`Użytkownik „${username}” został pomyślnie utworzony!`, 'success');
               renderAdminPanel();
             } catch (err) {
-              submitBtn.disabled = false;
-              submitBtn.textContent = 'Utwórz użytkownika';
               showToast(err.message, 'error');
             }
           });
-
         } else if (state.adminActiveTab === 'talk') {
           tabContent.innerHTML = `
             <div class="admin-section">
@@ -3012,7 +3562,7 @@
                 ` : talkMessages.map(msg => `
                   <div class="talk-mod-card" data-id="${msg.id}">
                     <div class="talk-mod-header">
-                      <span>Artykuł: <strong><a href="#/wiki/${encodeURIComponent(msg.article_slug)}/talk">${escapeHtml(msg.article_title || msg.article_slug)}</a></strong></span>
+                      <span>Artykuł: <strong><a href="#/wiki/${msg.article_slug}/talk">${escapeHtml(msg.article_title || msg.article_slug)}</a></strong></span>
                       <span>Autor: <strong>${escapeHtml(msg.author || 'Anonim')}</strong></span>
                       <span>Data: ${formatDate(msg.created_at)}</span>
                     </div>
@@ -3029,28 +3579,33 @@
           tabContent.querySelectorAll('.delete-talk-btn').forEach(btn => {
             btn.addEventListener('click', async () => {
               const id = btn.dataset.id;
-              if (!confirm('Czy na pewno chcesz usunąć ten wpis z dyskusji?')) return;
-              btn.disabled = true;
+              const confirmed = await showConfirmModal({
+                title: 'Usunięcie wpisu z dyskusji',
+                message: 'Czy na pewno chcesz usunąć ten wpis z dyskusji?',
+                confirmText: 'Usuń wpis',
+                cancelText: 'Anuluj',
+                danger: true
+              });
+              if (!confirmed) return;
+
               try {
                 await api(`/api/admin/talk/${id}`, {
                   method: 'DELETE'
                 });
-                showToast('Wpis został pomyślnie usunięty', 'success');
+                showToast('Wpis został usunięty.', 'success');
                 renderAdminPanel();
               } catch (err) {
-                btn.disabled = false;
                 showToast(err.message, 'error');
               }
             });
           });
-
         } else if (state.adminActiveTab === 'settings') {
           tabContent.innerHTML = `
             <div class="admin-section">
               <h2>⚙️ Ustawienia Encyklopedii</h2>
               <form id="admin-settings-form" class="admin-settings-form">
                 <div class="form-group">
-                  <label for="set-site-name">Nazwa witryny: <span class="required">*</span></label>
+                  <label for="set-site-name">Nazwa witryny:</label>
                   <input type="text" id="set-site-name" class="form-control" value="${escapeHtml(settings.site_name || 'WikiKurekk')}" required />
                 </div>
                 <div class="form-group">
@@ -3060,35 +3615,25 @@
                 <div class="form-group">
                   <label for="set-announcement">Baner ogłoszeniowy na samej górze strony:</label>
                   <input type="text" id="set-announcement" class="form-control" value="${escapeHtml(settings.announcement_banner || '')}" placeholder="Pozostaw puste, aby ukryć baner" />
-                  <small class="form-hint" style="color:var(--wiki-text-muted); font-size:0.82rem;">Tekst widoczny dla wszystkich czytelników na szczycie strony.</small>
+                  <small class="form-hint">Tekst widoczny dla wszystkich czytelników na szczycie strony.</small>
                 </div>
-                <div class="form-group checkbox-group" style="margin:14px 0;">
-                  <label style="cursor:pointer; display:flex; align-items:center; gap:8px;">
+                <div class="form-group checkbox-group">
+                  <label>
                     <input type="checkbox" id="set-anon-edits" ${String(settings.allow_anonymous_edits) === '1' ? 'checked' : ''} />
-                    <span>Zezwalaj na anonimowe edycje (bez logowania)</span>
+                    Zezwalaj na anonimowe edycje (bez logowania)
                   </label>
                 </div>
-                <button type="submit" id="admin-settings-submit" class="btn btn-primary">Zapisz ustawienia</button>
+                <button type="submit" class="btn btn-primary">Zapisz ustawienia</button>
               </form>
             </div>
           `;
 
-          const settingsForm = document.getElementById('admin-settings-form');
-          settingsForm.addEventListener('submit', async (e) => {
+          document.getElementById('admin-settings-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const site_name = document.getElementById('set-site-name').value.trim();
             const site_tagline = document.getElementById('set-site-tagline').value.trim();
             const announcement_banner = document.getElementById('set-announcement').value.trim();
             const allow_anonymous_edits = document.getElementById('set-anon-edits').checked ? '1' : '0';
-
-            if (!site_name) {
-              showToast('Nazwa witryny nie może być pusta', 'warning');
-              return;
-            }
-
-            const submitBtn = document.getElementById('admin-settings-submit');
-            submitBtn.disabled = true;
-            submitBtn.textContent = 'Zapisywanie...';
 
             try {
               const res = await api('/api/admin/settings', {
@@ -3097,43 +3642,45 @@
               });
               state.settings = res.settings;
               updateHeaderAndSidebar();
-              submitBtn.disabled = false;
-              submitBtn.textContent = 'Zapisz ustawienia';
               showToast('Ustawienia encyklopedii zostały zaktualizowane!', 'success');
             } catch (err) {
-              submitBtn.disabled = false;
-              submitBtn.textContent = 'Zapisz ustawienia';
               showToast(err.message, 'error');
             }
           });
-
         } else if (state.adminActiveTab === 'audit') {
           tabContent.innerHTML = `
             <div class="admin-section">
               <h2>Dziennik zdarzeń (Audit Log)</h2>
               <p class="admin-section-lead">Rejestr najważniejszych operacji administracyjnych i redakcyjnych.</p>
-              <div class="audit-log-list">
-                ${auditLogs.length === 0 ? `
-                  <p>Brak wpisów w dzienniku zdarzeń.</p>
-                ` : auditLogs.map(log => `
-                  <div class="audit-log-item">
-                    <div>
-                      <span class="audit-log-time">${formatDate(log.created_at)}</span>
-                      &nbsp;&middot;&nbsp;
-                      <span class="audit-actor"><strong>${escapeHtml(log.actor || 'System')}</strong></span>
-                      &nbsp;&middot;&nbsp;
-                      <code class="audit-log-action">${escapeHtml(log.action)}</code>
-                    </div>
-                    <div class="audit-details"><em>${escapeHtml(log.details || '')}</em></div>
-                  </div>
-                `).join('')}
+              <div class="table-responsive">
+                <table class="wiki-table admin-table">
+                  <thead>
+                    <tr>
+                      <th>Data i czas</th>
+                      <th>Użytkownik</th>
+                      <th>Zdarzenie</th>
+                      <th>Szczegóły</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${auditLogs.length === 0 ? `
+                      <tr><td colspan="4">Brak wpisów w dzienniku zdarzeń.</td></tr>
+                    ` : auditLogs.map(log => `
+                      <tr class="audit-row">
+                        <td class="audit-date">${formatDate(log.created_at)}</td>
+                        <td class="audit-actor"><strong>${escapeHtml(log.actor || 'System')}</strong></td>
+                        <td class="audit-action"><code>${escapeHtml(log.action)}</code></td>
+                        <td class="audit-details">${escapeHtml(log.details || '')}</td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>
               </div>
             </div>
           `;
         }
       };
 
-      // Podpięcie kliknięć w zakładki admina
       document.querySelectorAll('.admin-tab-btn').forEach(btn => {
         btn.addEventListener('click', () => {
           state.adminActiveTab = btn.dataset.tab;
@@ -3142,22 +3689,26 @@
       });
 
       renderCurrentAdminSubTab();
-
     } catch (err) {
-      viewRoot.innerHTML = `
-        <div class="wiki-error">
-          <p>Błąd wczytywania panelu administratora: ${escapeHtml(err.message)}</p>
-          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
-        </div>
-      `;
+      viewRoot.innerHTML = `<div class="wiki-error">Błąd wczytywania panelu admina: ${escapeHtml(err.message)}</div>`;
     }
   }
 
   // --- Router hash-based ---
+  function safeDecodeHashPart(val) {
+    try {
+      return decodeURIComponent(val);
+    } catch {
+      return val;
+    }
+  }
+
   function parseCurrentRoute() {
     const rawHash = window.location.hash || '#/';
-    const [pathPart, queryPart] = rawHash.split('?');
-    const query = new URLSearchParams(queryPart || '');
+    const qIdx = rawHash.indexOf('?');
+    const pathPart = qIdx === -1 ? rawHash : rawHash.slice(0, qIdx);
+    const queryPart = qIdx === -1 ? '' : rawHash.slice(qIdx + 1);
+    const query = new URLSearchParams(queryPart);
 
     if (pathPart === '' || pathPart === '#' || pathPart === '#/') {
       return { name: 'home', params: {}, query };
@@ -3167,9 +3718,6 @@
     }
     if (pathPart === '#/articles') {
       return { name: 'articles', params: {}, query };
-    }
-    if (pathPart === '#/watchlist') {
-      return { name: 'watchlist', params: {}, query };
     }
     if (pathPart === '#/recent-changes') {
       return { name: 'recent-changes', params: {}, query };
@@ -3182,59 +3730,49 @@
       if (!sub) {
         return { name: 'categories', params: {}, query };
       }
-      return { name: 'categories-detail', params: { category: decodeURIComponent(sub) }, query };
+      return { name: 'categories-detail', params: { category: safeDecodeHashPart(sub) }, query };
     }
 
-    // #/wiki/:slug/edit
     const editMatch = pathPart.match(/^#\/wiki\/([^/]+)\/edit$/);
     if (editMatch) {
-      return { name: 'wiki-edit', params: { slug: decodeURIComponent(editMatch[1]) }, query };
+      return { name: 'wiki-edit', params: { slug: safeDecodeHashPart(editMatch[1]) }, query };
     }
 
-    // #/wiki/:slug/talk
     const talkMatch = pathPart.match(/^#\/wiki\/([^/]+)\/talk$/);
     if (talkMatch) {
-      return { name: 'wiki-talk', params: { slug: decodeURIComponent(talkMatch[1]) }, query };
+      return { name: 'wiki-talk', params: { slug: safeDecodeHashPart(talkMatch[1]) }, query };
     }
 
-    // #/wiki/:slug/history
     const histMatch = pathPart.match(/^#\/wiki\/([^/]+)\/history$/);
     if (histMatch) {
-      return { name: 'wiki-history', params: { slug: decodeURIComponent(histMatch[1]) }, query };
+      return { name: 'wiki-history', params: { slug: safeDecodeHashPart(histMatch[1]) }, query };
     }
 
-    // #/wiki/:slug
     const viewMatch = pathPart.match(/^#\/wiki\/([^/]+)$/);
     if (viewMatch) {
-      return { name: 'wiki-view', params: { slug: decodeURIComponent(viewMatch[1]) }, query };
+      return { name: 'wiki-view', params: { slug: safeDecodeHashPart(viewMatch[1]) }, query };
     }
 
     return { name: 'home', params: {}, query };
   }
 
   function handleRoute() {
+    if (activeEditorGuard) {
+      activeEditorGuard.cleanup();
+      activeEditorGuard = null;
+    }
+
+    setSidebarOpen(false);
     const route = parseCurrentRoute();
     state.currentRoute = route;
     updateHeaderAndSidebar();
 
-    // Sprzątanie trybu Zen przy opuszczeniu edytora
-    if (route.name !== 'wiki-edit' && route.name !== 'new') {
-      document.body.classList.remove('editor-zen-active');
-    }
-
-    // Zamknięcie podpowiedzi wyszukiwania przy zmianie trasy
     const suggestions = document.getElementById('search-suggestions');
-    if (suggestions) suggestions.classList.add('hidden');
     const searchInput = document.getElementById('search-input');
-    if (searchInput) searchInput.setAttribute('aria-expanded', 'false');
-
-    // Płynne przewinięcie na górę strony
-    window.scrollTo({ top: 0, behavior: 'instant' });
-
-    // Focus na głównym widoku dla czytników ekranowych
-    const viewRoot = document.getElementById('view-root');
-    if (viewRoot) {
-      viewRoot.focus({ preventScroll: true });
+    if (suggestions) suggestions.classList.add('hidden');
+    if (searchInput) {
+      searchInput.setAttribute('aria-expanded', 'false');
+      searchInput.setAttribute('aria-activedescendant', '');
     }
 
     switch (route.name) {
@@ -3261,12 +3799,10 @@
       case 'articles': {
         const q = route.query.get('q') || '';
         const cat = route.query.get('category') || '';
-        renderArticlesCatalog(q, cat);
+        const sort = route.query.get('sort') || 'featured';
+        renderArticlesCatalog(q, cat, sort);
         break;
       }
-      case 'watchlist':
-        renderWatchlistView();
-        break;
       case 'categories':
         renderCategoriesView(null);
         break;
@@ -3289,28 +3825,28 @@
     const authModal = document.getElementById('auth-modal');
     if (!authModal) return;
 
-    lastFocusedElementBeforeModal = document.activeElement;
+    if (authModal.classList.contains('hidden')) {
+      lastAuthTriggerEl = document.activeElement;
+      resetAuthForms();
+    } else {
+      ['login-error', 'register-error'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+          el.textContent = '';
+          el.classList.add('hidden');
+        }
+      });
+    }
+
     const isRegister = mode === 'register';
     document.getElementById('login-form')?.classList.toggle('hidden', isRegister);
     document.getElementById('register-form')?.classList.toggle('hidden', !isRegister);
     const title = document.getElementById('auth-modal-title');
     if (title) title.textContent = isRegister ? 'Zarejestruj się' : 'Zaloguj się';
     authModal.classList.remove('hidden');
-
-    setTimeout(() => {
-      document.getElementById(isRegister ? 'reg-username' : 'login-username')?.focus();
-    }, 50);
+    document.getElementById(isRegister ? 'reg-username' : 'login-username')?.focus();
   }
 
-  function closeAuthModal() {
-    const authModal = document.getElementById('auth-modal');
-    if (authModal) authModal.classList.add('hidden');
-    if (lastFocusedElementBeforeModal && typeof lastFocusedElementBeforeModal.focus === 'function') {
-      lastFocusedElementBeforeModal.focus();
-    }
-  }
-
-  // --- Inicjalizacja formularza logowania / rejestracji i modala ---
   function initAuthAndModals() {
     const authModal = document.getElementById('auth-modal');
     const authModalBtn = document.getElementById('auth-modal-btn');
@@ -3318,61 +3854,67 @@
     const authModalClose = document.getElementById('auth-modal-close');
     const logoutBtn = document.getElementById('logout-btn');
 
+    const closeModal = () => {
+      if (!authModal || authModal.classList.contains('hidden')) return;
+      authModal.classList.add('hidden');
+      resetAuthForms();
+      if (lastAuthTriggerEl && typeof lastAuthTriggerEl.focus === 'function' && document.contains(lastAuthTriggerEl)) {
+        lastAuthTriggerEl.focus();
+      }
+      lastAuthTriggerEl = null;
+    };
+
     if (authModalBtn) authModalBtn.addEventListener('click', () => openAuthModal('login'));
     if (registerModalBtn) registerModalBtn.addEventListener('click', () => openAuthModal('register'));
     document.querySelectorAll('[data-auth-mode]').forEach(btn => {
       btn.addEventListener('click', () => openAuthModal(btn.dataset.authMode));
     });
-    if (authModalClose) authModalClose.addEventListener('click', closeAuthModal);
+    if (authModalClose) authModalClose.addEventListener('click', closeModal);
     if (authModal) {
       authModal.addEventListener('click', (e) => {
-        if (e.target === authModal) closeAuthModal();
+        if (e.target === authModal) closeModal();
       });
     }
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && authModal && !authModal.classList.contains('hidden')) {
-        closeAuthModal();
+      if (e.key === 'Escape') {
+        if (document.querySelector('.confirm-modal-backdrop')) return;
+        if (authModal && !authModal.classList.contains('hidden')) {
+          closeModal();
+          return;
+        }
+        setSidebarOpen(false);
       }
     });
 
-    // Wylogowanie
     if (logoutBtn) {
       logoutBtn.addEventListener('click', async () => {
-        logoutBtn.disabled = true;
+        const canLeave = await confirmLeaveEditorIfDirty();
+        if (!canLeave) return;
         try {
-          await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
+          await api('/api/auth/logout', { method: 'POST', suppressAuthExpiry: true }).catch(() => {});
         } finally {
           clearAuthToken();
-          logoutBtn.disabled = false;
           showToast('Wylogowano pomyślnie.', 'info');
           handleRoute();
         }
       });
     }
 
-    // Formularz logowania
     const loginForm = document.getElementById('login-form');
     if (loginForm) {
       loginForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const usernameInput = document.getElementById('login-username');
         const passwordInput = document.getElementById('login-password');
+        const errorEl = document.getElementById('login-error');
         const submitBtn = document.getElementById('login-submit');
-
         const username = usernameInput ? usernameInput.value.trim() : '';
         const password = passwordInput ? passwordInput.value : '';
 
-        if (!username) {
-          showToast('Wpisz nazwę użytkownika', 'warning');
-          usernameInput?.focus();
-          return;
+        if (errorEl) {
+          errorEl.textContent = '';
+          errorEl.classList.add('hidden');
         }
-        if (!password) {
-          showToast('Wpisz hasło', 'warning');
-          passwordInput?.focus();
-          return;
-        }
-
         if (submitBtn) {
           submitBtn.disabled = true;
           submitBtn.textContent = 'Logowanie...';
@@ -3384,11 +3926,14 @@
             body: { username, password }
           });
           setAuthToken(res.token, res.user);
-          closeAuthModal();
+          closeModal();
           showToast(`Witaj z powrotem, ${res.user.username}!`, 'success');
-          if (passwordInput) passwordInput.value = '';
-          handleRoute();
+          if (!activeEditorGuard) handleRoute();
         } catch (err) {
+          if (errorEl) {
+            errorEl.textContent = err.message;
+            errorEl.classList.remove('hidden');
+          }
           showToast(err.message, 'error');
         } finally {
           if (submitBtn) {
@@ -3399,7 +3944,6 @@
       });
     }
 
-    // Formularz rejestracji
     const registerForm = document.getElementById('register-form');
     if (registerForm) {
       registerForm.addEventListener('submit', async (e) => {
@@ -3407,26 +3951,20 @@
         const usernameInput = document.getElementById('reg-username');
         const passwordInput = document.getElementById('reg-password');
         const bioInput = document.getElementById('reg-bio');
+        const errorEl = document.getElementById('register-error');
         const submitBtn = document.getElementById('reg-submit');
 
         const username = usernameInput ? usernameInput.value.trim() : '';
         const password = passwordInput ? passwordInput.value : '';
         const bio = bioInput ? bioInput.value.trim() : '';
 
-        if (!username || username.length < 2) {
-          showToast('Nazwa użytkownika musi zawierać co najmniej 2 znaki', 'warning');
-          usernameInput?.focus();
-          return;
+        if (errorEl) {
+          errorEl.textContent = '';
+          errorEl.classList.add('hidden');
         }
-        if (!password || password.length < 3) {
-          showToast('Hasło musi zawierać co najmniej 3 znaki', 'warning');
-          passwordInput?.focus();
-          return;
-        }
-
         if (submitBtn) {
           submitBtn.disabled = true;
-          submitBtn.textContent = 'Rejestrowanie...';
+          submitBtn.textContent = 'Tworzenie konta...';
         }
 
         try {
@@ -3435,11 +3973,14 @@
             body: { username, password, bio }
           });
           setAuthToken(res.token, res.user);
-          closeAuthModal();
+          closeModal();
           showToast(`Konto ${res.user.username} zostało zarejestrowane!`, 'success');
-          if (passwordInput) passwordInput.value = '';
-          handleRoute();
+          if (!activeEditorGuard) handleRoute();
         } catch (err) {
+          if (errorEl) {
+            errorEl.textContent = err.message;
+            errorEl.classList.remove('hidden');
+          }
           showToast(err.message, 'error');
         } finally {
           if (submitBtn) {
@@ -3451,28 +3992,60 @@
     }
   }
 
-  // --- Dynamiczna wyszukiwarka z obsługą FTS5 i losowanie artykułu ---
+  // --- Dynamiczna wyszukiwarka z nawigacją klawiaturą i losowanie artykułu ---
   function initSearchAndRandom() {
     const searchForm = document.getElementById('search-form');
     const searchInput = document.getElementById('search-input');
     const suggestionsEl = document.getElementById('search-suggestions');
     const randomBtn = document.getElementById('random-article-btn');
 
-    let activeSuggestionIndex = -1;
     let searchDebounceTimer = null;
-    let searchRequestId = 0;
+    let searchAbortController = null;
+    let searchRequestSeq = 0;
+    let activeSuggestionIdx = -1;
 
-    // Losowy artykuł
+    function getNavigableSuggestionItems() {
+      if (!suggestionsEl) return [];
+      return Array.from(suggestionsEl.querySelectorAll('a.search-suggestion-item'));
+    }
+
+    function hideSuggestions() {
+      if (!suggestionsEl) return;
+      suggestionsEl.classList.add('hidden');
+      activeSuggestionIdx = -1;
+      if (searchInput) {
+        searchInput.setAttribute('aria-expanded', 'false');
+        searchInput.setAttribute('aria-activedescendant', '');
+      }
+    }
+
+    function setActiveSuggestion(nextIdx) {
+      const items = getNavigableSuggestionItems();
+      if (items.length === 0) {
+        activeSuggestionIdx = -1;
+        searchInput?.setAttribute('aria-activedescendant', '');
+        return;
+      }
+      if (nextIdx < 0) nextIdx = items.length - 1;
+      if (nextIdx >= items.length) nextIdx = 0;
+      activeSuggestionIdx = nextIdx;
+
+      items.forEach((item, idx) => {
+        const isActive = idx === activeSuggestionIdx;
+        item.classList.toggle('active', isActive);
+        item.setAttribute('aria-selected', isActive ? 'true' : 'false');
+        if (isActive) {
+          item.scrollIntoView({ block: 'nearest' });
+          searchInput?.setAttribute('aria-activedescendant', item.id || '');
+        }
+      });
+    }
+
     const goToRandomArticle = async () => {
       try {
         const res = await api('/api/articles/random');
         if (res.slug) {
-          const targetHash = `#/wiki/${encodeURIComponent(res.slug)}`;
-          if (window.location.hash === targetHash) {
-            handleRoute();
-          } else {
-            window.location.hash = targetHash;
-          }
+          navigateWithGuard(`#/wiki/${res.slug}`);
         }
       } catch (err) {
         showToast(err.message, 'error');
@@ -3481,182 +4054,152 @@
 
     if (randomBtn) randomBtn.addEventListener('click', goToRandomArticle);
 
-    // Aktualizacja podświetlenia klawiaturą
-    function updateActiveSuggestion() {
-      const items = suggestionsEl.querySelectorAll('.search-suggestion-item');
-      items.forEach((item, idx) => {
-        if (idx === activeSuggestionIndex) {
-          item.classList.add('active');
-          item.setAttribute('aria-selected', 'true');
-          item.scrollIntoView({ block: 'nearest' });
-        } else {
-          item.classList.remove('active');
-          item.setAttribute('aria-selected', 'false');
-        }
-      });
-    }
-
-    // Formularz szukania
     if (searchForm) {
       searchForm.addEventListener('submit', (e) => {
         e.preventDefault();
-        const items = suggestionsEl.querySelectorAll('.search-suggestion-item');
-        if (activeSuggestionIndex >= 0 && items[activeSuggestionIndex]) {
-          const chosen = items[activeSuggestionIndex];
-          const href = chosen.getAttribute('href');
-          if (href) {
-            suggestionsEl.classList.add('hidden');
-            searchInput.setAttribute('aria-expanded', 'false');
-            window.location.hash = href;
-            return;
-          }
+        const items = getNavigableSuggestionItems();
+        if (activeSuggestionIdx >= 0 && items[activeSuggestionIdx] && !suggestionsEl.classList.contains('hidden')) {
+          const href = items[activeSuggestionIdx].getAttribute('href');
+          hideSuggestions();
+          if (href) navigateWithGuard(href);
+          return;
         }
-
         const q = searchInput ? searchInput.value.trim() : '';
         if (q) {
-          suggestionsEl.classList.add('hidden');
-          searchInput.setAttribute('aria-expanded', 'false');
-          window.location.hash = `#/articles?q=${encodeURIComponent(q)}`;
-        } else {
-          showToast('Wpisz frazę do wyszukania', 'warning');
-          searchInput?.focus();
+          hideSuggestions();
+          navigateWithGuard(`#/articles?q=${encodeURIComponent(q)}`);
         }
       });
     }
 
-    // Dynamiczne podpowiedzi w wyszukiwarce (debounced z FTS5)
     if (searchInput && suggestionsEl) {
       searchInput.addEventListener('input', () => {
         if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
         const query = searchInput.value.trim();
-        activeSuggestionIndex = -1;
 
         if (query.length === 0) {
+          if (searchAbortController) searchAbortController.abort();
           suggestionsEl.innerHTML = '';
-          suggestionsEl.classList.add('hidden');
-          searchInput.setAttribute('aria-expanded', 'false');
+          hideSuggestions();
           return;
         }
 
-        const currentReq = ++searchRequestId;
-
         searchDebounceTimer = setTimeout(async () => {
+          const seq = ++searchRequestSeq;
+          if (searchAbortController) searchAbortController.abort();
+          searchAbortController = new AbortController();
+
           try {
-            // Najpierw próbujemy zaawansowany endpoint FTS5 /api/search
-            let data = await api(`/api/search?q=${encodeURIComponent(query)}`).catch(() => null);
-            if (!data || (!data.articles && !data.results)) {
-              data = await api(`/api/articles?q=${encodeURIComponent(query)}`);
-            }
-            if (currentReq !== searchRequestId) return;
+            const data = await api(`/api/articles?q=${encodeURIComponent(query)}`, {
+              signal: searchAbortController.signal
+            });
+            if (seq !== searchRequestSeq) return;
 
-            const results = (data.articles || data.results || []).slice(0, 5);
+            const results = (data.articles || []).slice(0, 5);
+            activeSuggestionIdx = -1;
 
+            let html = '';
+            let optCounter = 0;
             if (results.length === 0) {
-              suggestionsEl.innerHTML = `
-                <div class="search-suggestion-item search-suggestion-empty" role="option">
+              html += `
+                <div class="search-suggestion-item search-suggestion-empty">
                   Brak wyników dla „${escapeHtml(query)}”
                 </div>
-                ${canEditWiki() ? `
-                  <a href="#/new?title=${encodeURIComponent(query)}" class="search-suggestion-item search-suggestion-create" role="option">
-                    ➕ Utwórz brakujący artykuł: <strong>${escapeHtml(query)}</strong>
-                  </a>
-                ` : ''}
               `;
             } else {
-              suggestionsEl.innerHTML = `
-                ${results.map(art => {
-                  const snippetHtml = art.snippet
-                    ? renderSearchSnippet(art.snippet)
-                    : escapeHtml(art.summary || '');
-                  return `
-                    <a href="#/wiki/${encodeURIComponent(art.slug)}" class="search-suggestion-item" role="option">
-                      <div class="search-suggestion-title">${escapeHtml(art.title)}</div>
-                      ${snippetHtml ? `<div class="search-suggestion-snippet">${snippetHtml}</div>` : ''}
-                    </a>
-                  `;
-                }).join('')}
-                ${canEditWiki() ? `
-                  <a href="#/new?title=${encodeURIComponent(query)}" class="search-suggestion-item search-suggestion-create" role="option">
-                    ➕ Utwórz brakujący artykuł: <strong>${escapeHtml(query)}</strong>
-                  </a>
-                ` : ''}
+              html += results.map(art => `
+                <a href="#/wiki/${art.slug}" id="search-opt-${optCounter++}" role="option" aria-selected="false" class="search-suggestion-item">
+                  <div class="search-suggestion-title">${escapeHtml(art.title)}</div>
+                  ${art.summary ? `<div class="search-suggestion-snippet">${escapeHtml(art.summary)}</div>` : ''}
+                </a>
+              `).join('');
+            }
+
+            if (canEditWiki()) {
+              html += `
+                <a href="#/new?title=${encodeURIComponent(query)}" id="search-opt-${optCounter++}" role="option" aria-selected="false" class="search-suggestion-item search-suggestion-create">
+                  ➕ Utwórz brakujący artykuł: <strong>${escapeHtml(query)}</strong>
+                </a>
               `;
             }
 
+            suggestionsEl.innerHTML = html;
             suggestionsEl.classList.remove('hidden');
             searchInput.setAttribute('aria-expanded', 'true');
-            activeSuggestionIndex = -1;
-          } catch {
-            if (currentReq === searchRequestId) {
-              suggestionsEl.classList.add('hidden');
-              searchInput.setAttribute('aria-expanded', 'false');
-            }
+            searchInput.setAttribute('aria-activedescendant', '');
+          } catch (err) {
+            if (err.name === 'AbortError') return;
+            hideSuggestions();
           }
         }, 200);
       });
 
-      // Obsługa nawigacji klawiaturą w podpowiedziach
-      searchInput.addEventListener('keydown', (e) => {
-        const isVisible = !suggestionsEl.classList.contains('hidden');
-        if (!isVisible) return;
-
-        const items = suggestionsEl.querySelectorAll('.search-suggestion-item');
-        if (items.length === 0) return;
-
-        if (e.key === 'ArrowDown') {
-          e.preventDefault();
-          activeSuggestionIndex = (activeSuggestionIndex + 1) % items.length;
-          updateActiveSuggestion();
-        } else if (e.key === 'ArrowUp') {
-          e.preventDefault();
-          activeSuggestionIndex = (activeSuggestionIndex - 1 + items.length) % items.length;
-          updateActiveSuggestion();
-        } else if (e.key === 'Escape') {
-          e.preventDefault();
-          suggestionsEl.classList.add('hidden');
-          searchInput.setAttribute('aria-expanded', 'false');
-          activeSuggestionIndex = -1;
-        }
-      });
-
-      // Kliknięcie w element podpowiedzi zamyka menu
-      suggestionsEl.addEventListener('click', (e) => {
-        const item = e.target.closest('.search-suggestion-item');
-        if (item) {
-          suggestionsEl.classList.add('hidden');
-          searchInput.setAttribute('aria-expanded', 'false');
-          activeSuggestionIndex = -1;
-        }
-      });
-
-      // Kliknięcie poza wyszukiwarką zamyka podpowiedzi
       document.addEventListener('click', (e) => {
         if (!searchForm.contains(e.target)) {
-          suggestionsEl.classList.add('hidden');
-          searchInput.setAttribute('aria-expanded', 'false');
-          activeSuggestionIndex = -1;
+          hideSuggestions();
+        }
+      });
+
+      searchInput.addEventListener('keydown', (e) => {
+        if (suggestionsEl.classList.contains('hidden')) return;
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setActiveSuggestion(activeSuggestionIdx + 1);
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setActiveSuggestion(activeSuggestionIdx - 1);
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          hideSuggestions();
+        } else if (e.key === 'Enter' && activeSuggestionIdx >= 0) {
+          const items = getNavigableSuggestionItems();
+          if (items[activeSuggestionIdx]) {
+            e.preventDefault();
+            const href = items[activeSuggestionIdx].getAttribute('href');
+            hideSuggestions();
+            if (href) navigateWithGuard(href);
+          }
         }
       });
     }
   }
 
-  // --- Przechwytywanie kliknięć czerwonych linków, kotwic, spisu treści i zakładek ---
+  // --- Przechwytywanie kliknięć linków, kotwic, TOC i zakładek ---
   function initGlobalClickHandlers() {
     document.addEventListener('click', (e) => {
-      // Rozwijanie / zwijanie spisu treści TOC
-      const tocToggleBtn = e.target.closest('#toc-toggle-btn');
-      if (tocToggleBtn) {
+      // Skip link - płynne przejście do #view-root bez zmiany hasha SPA
+      const skipLink = e.target.closest('a.skip-link');
+      if (skipLink) {
         e.preventDefault();
-        const tocNav = tocToggleBtn.closest('.wiki-toc');
-        if (tocNav) {
-          const isCollapsed = tocNav.classList.toggle('collapsed');
-          tocToggleBtn.textContent = isCollapsed ? '[pokaż]' : '[ukryj]';
-          tocToggleBtn.setAttribute('aria-expanded', String(!isCollapsed));
+        const viewRoot = document.getElementById('view-root');
+        if (viewRoot) {
+          viewRoot.focus({ preventScroll: false });
+          viewRoot.scrollIntoView({ behavior: 'smooth' });
         }
         return;
       }
 
-      // Płynne przewijanie do kotwic wewnątrz artykułu (TOC, przypisy, sekcje)
+      // Jeśli kliknięto wewnątrz #preview-box edytora, obsługuje to listener na #preview-box
+      if (e.target.closest('#preview-box')) {
+        return;
+      }
+
+      // Przełączanie widoczności spisu treści (TOC)
+      const tocToggle = e.target.closest('.wiki-toc-toggle');
+      if (tocToggle) {
+        e.preventDefault();
+        const tocNav = tocToggle.closest('.wiki-toc');
+        const list = tocNav?.querySelector('.toc-list');
+        if (tocNav && list) {
+          const collapsed = list.classList.toggle('hidden');
+          tocNav.classList.toggle('is-collapsed', collapsed);
+          tocToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+          tocToggle.textContent = collapsed ? 'Pokaż' : 'Ukryj';
+        }
+        return;
+      }
+
+      // Płynne przewijanie do kotwic wewnątrz artykułu (TOC, przypisy)
       const anchorLink = e.target.closest('a[href^="#sekcja-"], a[href^="#ref-"], a[href^="#cite_"]');
       if (anchorLink) {
         e.preventDefault();
@@ -3664,7 +4207,6 @@
         const el = document.getElementById(targetId);
         if (el) {
           el.scrollIntoView({ behavior: 'smooth' });
-          el.focus?.();
         }
         return;
       }
@@ -3678,12 +4220,7 @@
           return;
         }
         const missingTitle = redLink.dataset.missingTitle || redLink.getAttribute('title') || redLink.textContent.trim();
-        const targetHash = `#/new?title=${encodeURIComponent(missingTitle)}`;
-        if (window.location.hash === targetHash) {
-          handleRoute();
-        } else {
-          window.location.hash = targetHash;
-        }
+        navigateWithGuard(`#/new?title=${encodeURIComponent(missingTitle)}`);
         return;
       }
 
@@ -3695,11 +4232,18 @@
         if (tabType === 'talk') targetHash = `#/wiki/${encodeURIComponent(state.activeSlug)}/talk`;
         if (tabType === 'edit') targetHash = `#/wiki/${encodeURIComponent(state.activeSlug)}/edit`;
         if (tabType === 'history') targetHash = `#/wiki/${encodeURIComponent(state.activeSlug)}/history`;
+        navigateWithGuard(targetHash);
+        return;
+      }
 
-        if (window.location.hash === targetHash) {
-          handleRoute();
-        } else {
-          window.location.hash = targetHash;
+      // Ochrona pozostałych linków SPA (#/...) podczas aktywnej brudnej sesji edytora
+      const spaLink = e.target.closest('a[href^="#/"]');
+      if (spaLink && activeEditorGuard && activeEditorGuard.isDirty()) {
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        const href = spaLink.getAttribute('href');
+        if (href && href !== activeEditorGuard.currentHash) {
+          e.preventDefault();
+          navigateWithGuard(href);
         }
       }
     });
@@ -3711,14 +4255,15 @@
     document.getElementById('theme-toggle-btn')?.addEventListener('click', () => {
       applyTheme(state.theme === 'dark' ? 'light' : 'dark');
     });
+
+    initSidebarDrawer();
     initAuthAndModals();
     initSearchAndRandom();
     initGlobalClickHandlers();
 
-    // Sprawdzenie sesji
     if (state.token) {
       try {
-        const authData = await api('/api/auth/me');
+        const authData = await api('/api/auth/me', { suppressAuthExpiry: true });
         if (authData.user) {
           state.currentUser = authData.user;
         } else {
@@ -3729,13 +4274,20 @@
       }
     }
 
-    // Pobranie konfiguracji wstępnej
     try {
-      const boot = await api('/api/bootstrap');
+      const boot = await api('/api/bootstrap', { suppressAuthExpiry: true });
       state.settings = boot.settings || state.settings;
       state.stats = boot.stats || state.stats;
       state.categories = boot.categories || state.categories;
       state.allSlugs = boot.allSlugs || state.allSlugs;
+      if (Array.isArray(boot.recentArticles)) {
+        boot.recentArticles.forEach(a => {
+          if (a && a.slug && a.title) state.articleTitlesBySlug[a.slug] = a.title;
+        });
+      }
+      if (boot.featuredArticle && boot.featuredArticle.slug && boot.featuredArticle.title) {
+        state.articleTitlesBySlug[boot.featuredArticle.slug] = boot.featuredArticle.title;
+      }
       if (boot.currentUser && !state.currentUser) {
         state.currentUser = boot.currentUser;
       }
@@ -3745,56 +4297,39 @@
 
     updateHeaderAndSidebar();
 
-    // Obsługa pływającego przycisku wyjścia z trybu Zen
-    const zenExitBtn = document.getElementById('zen-exit-floating-btn');
-    if (zenExitBtn) {
-      zenExitBtn.addEventListener('click', () => {
-        toggleZenMode(false);
-      });
-    }
+    window.addEventListener('hashchange', async () => {
+      if (isBypassingHashGuard) return;
+      const newHash = window.location.hash || '#/';
+      if (activeEditorGuard && activeEditorGuard.isDirty() && newHash !== activeEditorGuard.currentHash) {
+        isBypassingHashGuard = true;
+        history.replaceState(null, '', activeEditorGuard.currentHash);
+        isBypassingHashGuard = false;
 
-    // Skróty klawiszowe dla trybu Zen (Alt+Z oraz Escape)
-    document.addEventListener('keydown', (e) => {
-      if (e.altKey && (e.key === 'z' || e.key === 'Z')) {
-        if (state.currentRoute && (state.currentRoute.name === 'wiki-edit' || state.currentRoute.name === 'new')) {
-          e.preventDefault();
-          toggleZenMode();
+        const ok = await confirmLeaveEditorIfDirty();
+        if (ok) {
+          window.location.hash = newHash;
         }
+        return;
       }
-      if (e.key === 'Escape' && document.body.classList.contains('editor-zen-active')) {
-        toggleZenMode(false);
-      }
+      handleRoute();
     });
 
-    // Nasłuchiwanie zmian hasha w adresie
-    window.addEventListener('hashchange', handleRoute);
-
-    // Przekierowanie ścieżki /panel → #/panel
     if (window.location.pathname.replace(/\/+$/, '') === '/panel') {
       history.replaceState(null, '', '/#/panel');
     }
 
-    // Pierwsze uruchomienie routera
     handleRoute();
   }
 
-  // Obiekt pomocniczy dla inspekcji w oknie przeglądarki i testów
   window.wikiApp = {
     state,
     api,
     showToast,
     handleRoute,
     setAuthToken,
-    clearAuthToken,
-    parseCategories,
-    getCatName,
-    getCatCount,
-    renderWatchlistView,
-    slugify,
-    toggleZenMode
+    clearAuthToken
   };
 
-  // Uruchomienie po załadowaniu DOM
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initApp);
   } else {

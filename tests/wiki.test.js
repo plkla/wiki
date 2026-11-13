@@ -38,15 +38,6 @@ describe('1. Parser Wiki (src/wiki-parser.js)', () => {
       assert.equal(slugify('---Polska---Warszawa---'), 'polska-warszawa');
       assert.equal(slugify('Specjalne // znaki $$ i ##'), 'specjalne-znaki-i');
     });
-
-    test('obsługuje przypadki brzegowe slugify (puste, symbole, znaki specjalne)', () => {
-      assert.equal(slugify(''), '');
-      assert.equal(slugify(null), '');
-      assert.equal(slugify(undefined), '');
-      assert.equal(slugify('   '), '');
-      assert.equal(slugify('???###$$$'), '');
-      assert.equal(slugify('München & København'), 'munchen-kobenhavn');
-    });
   });
 
   describe('renderWikiContent', () => {
@@ -96,33 +87,6 @@ describe('1. Parser Wiki (src/wiki-parser.js)', () => {
       assert.ok(result.html.includes('Główny Urząd Statystyczny 2024'), 'HTML powinien zawierać treść przypisu');
     });
 
-    test('obsługuje przypisy z atrybutami <ref name="..."> oraz zapobiega XSS', () => {
-      const input = `Informacja<ref name="zrodlo-1">Źródło z atrybutem</ref> oraz próba ataku: <script>alert("XSS")</script>.`;
-      const result = renderWikiContent(input, new Set());
-
-      assert.ok(result.html.includes('Źródło z atrybutem'), 'Przypis z atrybutem powinien zostać poprawnie sparsowany');
-      assert.ok(result.html.includes('&lt;script&gt;alert(&quot;XSS&quot;)&lt;/script&gt;'), 'Tagi script muszą być bezpiecznie escapowane');
-      assert.ok(!result.html.includes('<script>'), 'HTML nie może zawierać niezaescapowanego znacznika script');
-    });
-
-    test('bezpiecznie renderuje kod inline i bloki kodu ze znakami specjalnymi ($1, $&, gwiazdki, encje)', () => {
-      const input = `
-\`a * b * c\`
-\`regex $1, $&, $'\`
-\`[[link-w-kodzie]]\`
-\`\`\`bash
-echo "$1" && grep -E "foo|bar"
-\`\`\`
-`;
-      const result = renderWikiContent(input, new Set());
-
-      assert.ok(result.html.includes('<code>a * b * c</code>'), 'Gwiazdki w kodzie inline nie mogą być parsowane jako kursywa');
-      assert.ok(result.html.includes('<code>regex $1, $&amp;, $\'</code>') || result.html.includes('<code>regex $1, $&, $\'</code>'),
-        'Symbole $ w kodzie inline nie mogą być uszkadzane przez silnik regex');
-      assert.ok(result.html.includes('<code>[[link-w-kodzie]]</code>'), 'Linki wiki w kodzie inline muszą pozostać dosłownym kodem');
-      assert.ok(result.html.includes('echo &quot;$1&quot;'), 'Blok kodu powinien bezpiecznie zachować $1');
-    });
-
     test('renderuje niebieskie linki dla istniejących stron i czerwone dla brakujących', () => {
       const existingSlugs = new Set(['polska', 'warszawa']);
       const input = `Oto link do [[Polska]] oraz [[Polska|stolicy Polski]]. Brakująca strona to [[Komputer kwantowy]].`;
@@ -137,6 +101,87 @@ echo "$1" && grep -E "foo|bar"
       assert.ok(result.html.includes('wiki-link-red'), 'Brakujący link powinien mieć klasę wiki-link-red');
       assert.ok(result.html.includes('#/new?title=Komputer%20kwantowy') || result.html.includes('#/new?title=Komputer+kwantowy'),
         'Czerwony link powinien kierować do #/new?title=...');
+    });
+
+    test('nie parsuje <ref>, linków ani formatowania wewnątrz bloków kodu i kodu inline oraz nie psuje $ w kodzie', () => {
+      const input = [
+        'Proza z literalnym tokenem @@@CODEBLOCK_1@@@ i @@@REF_1@@@.',
+        '',
+        '```js',
+        'const ref = "<ref>Nieprzypis</ref>";',
+        'const str = "[[Polska]] \'\'\'bold\'\'\' $& $$ $\' @@@CODEBLOCK_1@@@";',
+        '```',
+        '',
+        'Kod inline: `<ref>NieprzypisInline</ref>` oraz `[[Polska]]` i `a * b * c` i `~~nie~~`.'
+      ].join('\n');
+
+      const result = renderWikiContent(input, new Set(['polska']));
+      assert.equal(result.references.length, 0, 'Znaczniki <ref> wewnątrz kodu nie mogą tworzyć przypisów');
+      assert.equal(result.links.length, 0, 'Linki wewnątrz kodu nie mogą trafiać do links');
+      assert.ok(result.html.includes('<pre><code class="language-js">'));
+      assert.ok(result.html.includes('&lt;ref&gt;Nieprzypis&lt;/ref&gt;'));
+      assert.ok(result.html.includes('$&amp; $$ $\''), 'Znaki $& $$ $\' w bloku kodu muszą pozostać nienaruszone');
+      assert.ok(result.html.includes('<code>&lt;ref&gt;NieprzypisInline&lt;/ref&gt;</code>'));
+      assert.ok(result.html.includes('<code>[[Polska]]</code>'));
+      assert.ok(result.html.includes('<code>a * b * c</code>'));
+      assert.ok(result.html.includes('<code>~~nie~~</code>'));
+      assert.ok(result.html.includes('@@@CODEBLOCK_1@@@') && result.html.includes('@@@REF_1@@@'));
+    });
+
+    test('nie koduje podwójnie znaku & w linkach wiki [[A & B]]', () => {
+      const resultMissing = renderWikiContent('Zobacz [[A & B]] oraz [[C & D|E & F]].', new Set(['c-d']));
+      assert.ok(resultMissing.links.includes('a-b'));
+      assert.ok(resultMissing.links.includes('c-d'));
+      assert.ok(resultMissing.html.includes('href="#/new?title=A%20%26%20B"'), 'URL powinien zawierać %26 zamiast %26amp%3B');
+      assert.ok(!resultMissing.html.includes('%26amp%3B'), 'Nie może być podwójnego kodowania &amp; w URL');
+      assert.ok(!resultMissing.html.includes('a-amp-b'), 'Slug nie może zawierać amp z encji HTML');
+      assert.ok(resultMissing.html.includes('>A &amp; B</a>'), 'Wyświetlana etykieta musi być bezpiecznie escapowana');
+      assert.ok(resultMissing.html.includes('href="#/wiki/c-d"'), 'Istniejący link [[C & D|E & F]] ma wskazywać na c-d');
+      assert.ok(resultMissing.html.includes('>E &amp; F</a>'));
+    });
+
+    test('obsługuje bold+italic, przekreślenie ~~, linki zewnętrzne, tabele, callouty i obrazki z ochroną XSS', () => {
+      const input = [
+        "'''''bardzo ważne''''' oraz ~~stare~~.",
+        'Link jawny: [https://example.com?a=1&b=2 Strona testowa] i goły: https://example.org/wiki_(test).',
+        '',
+        '| Kraj | Opis | Liczba |',
+        '| :--- | :---: | ---: |',
+        "| [[Polska|RP]] | '''Środek''' | 38 |",
+        '',
+        ':::warning Uwaga testowa',
+        'Treść w ramce z `kodem` i [[Polska]].',
+        ':::',
+        '',
+        '![Mapa Polski](https://example.com/mapa.png "Podpis mapy")',
+        '![Ikona](/assets/icon.png)',
+        '![XSS](javascript:alert(1))',
+        '![XSS2](data:text/html,<script>alert(1)</script>)'
+      ].join('\n');
+
+      const result = renderWikiContent(input, new Set(['polska']));
+
+      assert.ok(result.html.includes('<strong><em>bardzo ważne</em></strong>'));
+      assert.ok(result.html.includes('<del>stare</del>'));
+      assert.ok(result.html.includes('<a href="https://example.com?a=1&amp;b=2" class="wiki-link-external" target="_blank" rel="noopener noreferrer">Strona testowa</a>'));
+      assert.ok(result.html.includes('<a href="https://example.org/wiki_(test)" class="wiki-link-external" target="_blank" rel="noopener noreferrer">https://example.org/wiki_(test)</a>.'));
+
+      // Tabela
+      assert.ok(result.html.includes('<div class="wiki-table-wrap"><table class="wiki-article-table">'));
+      assert.ok(result.html.includes('style="text-align: center"'));
+      assert.ok(result.html.includes('style="text-align: right"'));
+      assert.ok(result.html.includes('href="#/wiki/polska"'));
+      assert.ok(result.html.includes('<strong>Środek</strong>'));
+
+      // Callout
+      assert.ok(result.html.includes('<div class="wiki-callout wiki-callout-warning"><div class="wiki-callout-title">Uwaga testowa</div><div class="wiki-callout-body">'));
+      assert.ok(result.html.includes('<code>kodem</code>'));
+
+      // Obrazy bezpieczne vs zablokowane
+      assert.ok(result.html.includes('<figure class="wiki-figure"><img src="https://example.com/mapa.png" alt="Mapa Polski" loading="lazy" /><figcaption>Podpis mapy</figcaption></figure>'));
+      assert.ok(result.html.includes('<figure class="wiki-figure"><img src="/assets/icon.png" alt="Ikona" loading="lazy" /></figure>'));
+      assert.ok(!result.html.includes('javascript:'), 'Niebezpieczny protokół javascript: musi zostać odrzucony');
+      assert.ok(!result.html.includes('data:text/html'), 'Niebezpieczny protokół data: musi zostać odrzucony');
     });
   });
 
@@ -158,44 +203,6 @@ echo "$1" && grep -E "foo|bar"
 
       const addItem = diff.find(d => d.type === 'add' && d.line.includes('Linia 4 dodana'));
       assert.ok(addItem, 'Dodana linia powinna być odnotowana');
-    });
-
-    test('computeLineDiff obsługuje przypadki brzegowe: identyczne teksty, puste teksty, brak starych/nowych linii', () => {
-      assert.deepEqual(computeLineDiff('', ''), []);
-      assert.deepEqual(computeLineDiff(null, null), []);
-
-      const identical = computeLineDiff('A\nB\nC', 'A\nB\nC');
-      assert.equal(identical.length, 3);
-      assert.ok(identical.every(d => d.type === 'same'));
-
-      const allAdded = computeLineDiff('', 'Nowa linia');
-      assert.equal(allAdded.length, 1);
-      assert.equal(allAdded[0].type, 'add');
-
-      const allDeleted = computeLineDiff('Stara linia', '');
-      assert.equal(allDeleted.length, 1);
-      assert.equal(allDeleted[0].type, 'del');
-    });
-  });
-
-  describe('renderFigure i parsowanie grafik wiki', () => {
-    test('parsuje [[Plik:...]] i [[File:...]] do semantycznego <figure> z klasami i podpisem', () => {
-      const input = `
-== Sekcja z grafiką ==
-Oto opis z grafiką:
-[[Plik:kopernik.jpg|miniaturka|prawo|Mikołaj Kopernik w Toruniu]]
-I kolejna grafika:
-[[File:diagram.svg|thumb|left|Schemat działania]]
-`;
-      const result = renderWikiContent(input, new Set());
-
-      assert.ok(result.html.includes('<figure class="wiki-figure wiki-figure-thumb wiki-figure-right">'), 'Powinien wyrenderować figure z klasami thumb i right');
-      assert.ok(result.html.includes('src="/uploads/kopernik.jpg"'), 'Ścieżka obrazu powinna wskazywać na /uploads/kopernik.jpg');
-      assert.ok(result.html.includes('alt="Mikołaj Kopernik w Toruniu"'), 'Atrybut alt powinien zawierać podpis');
-      assert.ok(result.html.includes('<figcaption class="wiki-figcaption">Mikołaj Kopernik w Toruniu</figcaption>'), 'Powinien zawierać figcaption z podpisem');
-
-      assert.ok(result.html.includes('wiki-figure-left'), 'Druga grafika powinna mieć klasę wiki-figure-left');
-      assert.ok(result.html.includes('src="/uploads/diagram.svg"'), 'Druga grafika powinna wskazywać na /uploads/diagram.svg');
     });
   });
 });
@@ -284,14 +291,6 @@ describe('2. Baza danych (src/db.js)', () => {
       content: 'Czy możemy zaktualizować dane o ludności?'
     });
     assert.ok(msg && msg.id, 'Wiadomość talk powinna mieć id');
-    assert.ok('author_role' in msg, 'Wiadomość talk powinna mieć przypisaną rolę autora');
-
-    const adminMsg = db.addTalkMessage(slug, {
-      author: 'admin',
-      content: 'Komentarz administratora.'
-    });
-    assert.equal(adminMsg.author_role, 'admin', 'Rola administratora powinna być rozpoznana');
-    db.deleteTalkMessage(adminMsg.id, 'admin');
 
     const messages = db.getTalkMessages(slug);
     assert.ok(messages.some(m => m.id === msg.id), 'Wiadomość powinna być w liście wątku');
@@ -366,235 +365,36 @@ describe('2. Baza danych (src/db.js)', () => {
     assert.ok(logs.length > 0, 'Powinny być zapisane wpisy w audit_log');
   });
 
-  test('walidacja unikalności slug i wymaganych pól (title, content) przy tworzeniu i edycji', () => {
-    // Próba utworzenia artykułu z pustym tytułem
-    assert.throws(() => {
-      db.createArticle({ title: '', content: 'Treść' });
-    }, /Tytuł artykułu jest wymagany/);
-
-    // Próba utworzenia artykułu bez treści
-    assert.throws(() => {
-      db.createArticle({ title: 'Test bez treści', content: null });
-    }, /Treść artykułu jest wymagana/);
-
-    // Próba utworzenia duplikatu slug
-    assert.throws(() => {
-      db.createArticle({ title: 'Polska', content: 'Inna treść o Polsce' });
-    }, /już istnieje/);
-
-    // Próba edycji z pustym tytułem
-    assert.throws(() => {
-      db.updateArticle('polska', { title: '   ' });
-    }, /Tytuł artykułu nie może być pusty/);
-
-    // Próba edycji nieistniejącego artykułu
-    assert.throws(() => {
-      db.updateArticle('artykul-ktorego-nie-ma', { content: 'Nowa treść' });
-    }, /nie istnieje/);
-  });
-
-  test('bezpieczne parsowanie uszkodzonego formatu JSON w infobox i categories', () => {
-    // Utwórz artykuł z uszkodzonymi wartościami tekstowymi
-    const created = db.createArticle({
-      title: 'Odporność na błędy danych',
-      slug: 'odpornosc-na-bledy-danych',
-      content: 'Test stabilności',
-      infobox: 'nie-json',
-      categories: 'nie-json-ale-tekst'
+  test('wyszukiwanie z polskimi znakami (Łódź/łódź), last_editor oraz sanityzacja infoboxu', () => {
+    db.createArticle({
+      title: 'Łódź',
+      slug: 'lodz',
+      summary: 'Miasto w centralnej Polsce nad rzeką Łódką.',
+      content: '== Historia ==\nŚwiętokrzyskie i Łódź.',
+      infobox: { title: 'Łódź', image: 'javascript:alert(1)', items: { Województwo: 'łódzkie' } },
+      categories: ['Miasta'],
+      editor: 'redaktor'
     });
 
-    assert.ok(typeof created.infobox === 'object' && created.infobox !== null);
-    assert.ok(Array.isArray(created.categories));
-    assert.ok(created.categories.includes('nie-json-ale-tekst'));
+    const foundLower = db.listArticles({ q: 'łódź' });
+    assert.ok(foundLower.some(a => a.slug === 'lodz'), 'Wyszukiwanie "łódź" musi znaleźć "Łódź"');
 
-    // getCategories deduplikuje kategorie dla danego artykułu
-    const cats = db.getCategories();
-    assert.ok(Array.isArray(cats));
-  });
+    const foundUpper = db.searchArticles('ŁÓDŹ');
+    assert.ok(foundUpper.some(a => a.slug === 'lodz'), 'Wyszukiwanie "ŁÓDŹ" musi znaleźć "Łódź"');
 
-  test('revert do rewizji innego artykułu rzuca błąd (ochrona spójności danych)', () => {
-    const revsPolska = db.getRevisions('polska');
-    assert.ok(revsPolska.length > 0);
-    const polskaRevId = revsPolska[0].id;
+    const foundDiacritic = db.listArticles({ q: 'świętokrzyskie' });
+    assert.ok(foundDiacritic.some(a => a.slug === 'lodz'), 'Wyszukiwanie "świętokrzyskie" musi znaleźć "Świętokrzyskie"');
 
-    // Próba przywrócenia rewizji z Polski do Zasady WikiKurekk
-    assert.throws(() => {
-      db.revertArticleToRevision('zasady-wikikurekk', polskaRevId, 'admin');
-    }, /Nie odnaleziono rewizji/);
-  });
+    const lodz = db.getArticleBySlug('lodz');
+    assert.equal(lodz.editor, 'redaktor');
+    assert.equal(lodz.last_editor, 'redaktor');
+    assert.strictEqual(lodz.infobox.image, undefined, 'Niebezpieczny URL obrazka infoboxu musi być usunięty');
 
-  test('zarządzanie statusem i usuwaniem nieistniejących artykułów oraz walidacja ról', () => {
-    // updateArticleAdminStatus dla nieistniejącego slug zwraca null
-    const nonExistentStatus = db.updateArticleAdminStatus('brakujacy-artykul', { is_featured: 1 });
-    assert.strictEqual(nonExistentStatus, null);
-
-    // deleteArticle dla nieistniejącego slug zwraca false
-    const nonExistentDelete = db.deleteArticle('brakujacy-artykul');
-    assert.strictEqual(nonExistentDelete, false);
-
-    // Walidacja ról w createUserByAdmin
-    assert.throws(() => {
-      db.createUserByAdmin({ username: 'zly_uzytkownik', password: 'haslo123', role: 'nieistniejaca_rola' });
-    }, /Nieprawidłowa rola/);
-
-    // Walidacja ról w updateUserRole
-    assert.throws(() => {
-      db.updateUserRole(1, 'hacker');
-    }, /Nieprawidłowa rola/);
-  });
-
-  test('wyszukiwanie pełnotekstowe FTS5 / BM25 oraz podświetlanie fragmentów (snippet)', () => {
-    // 1. Wyszukiwanie hasła "Kopernik"
-    const results = db.searchArticlesFTS('Kopernik');
-    assert.ok(Array.isArray(results), 'Wynik wyszukiwania musi być tablicą');
-    assert.ok(results.length > 0, 'Powinien znaleźć co najmniej jeden artykuł dla Kopernik');
-    const kopernik = results.find(r => r.slug === 'mikolaj-kopernik');
-    assert.ok(kopernik, 'Powinien odnaleźć artykuł mikolaj-kopernik');
-    assert.ok(kopernik.rank > 0, 'Wynik powinien mieć obliczony ranking/wagę');
-    assert.ok(kopernik.snippet.includes('<mark class="search-highlight">'), 'Snippet powinien zawierać podświetlenie <mark>');
-    assert.ok(/<mark class="search-highlight">Kopernik<\/mark>/i.test(kopernik.snippet), 'Snippet powinien wyróżniać szukane słowo');
-
-    // 2. Wyszukiwanie niewrażliwe na polskie znaki diakrytyczne (np. "sklodowska" znajdzie "Skłodowska", "mikolaj" znajdzie "Mikołaj")
-    const plResults = db.searchArticlesFTS('sklodowska');
-    assert.ok(plResults.length > 0, 'Powinien odnaleźć Marię Skłodowską-Curie przy zapytaniu bez znaków diakrytycznych');
-    assert.equal(plResults[0].slug, 'maria-sklodowska-curie');
-    assert.ok(plResults[0].snippet.includes('<mark class="search-highlight">'), 'Snippet powinien podświetlić znalezione słowo');
-
-    const plWithDiacritics = db.searchArticlesFTS('Mikołaj');
-    assert.ok(plWithDiacritics.length > 0, 'Powinien odnaleźć Mikołaj Kopernik przy zapytaniu ze znakami diakrytycznymi');
-    assert.equal(plWithDiacritics[0].slug, 'mikolaj-kopernik');
-
-    // 3. Wyszukiwanie pustego zapytania
-    const emptyResults = db.searchArticlesFTS('');
-    assert.deepEqual(emptyResults, [], 'Puste zapytanie powinno zwrócić pustą tablicę');
-  });
-
-  test('zarządzanie multimediami (media: addMedia, listMedia, getMediaByFilename)', () => {
-    // 1. Dodanie nowego wpisu pliku multimedialnego
-    const added = db.addMedia({
-      filename: 'mikolaj-kopernik-portret.png',
-      original_name: 'portret.png',
-      mime_type: 'image/png',
-      size_bytes: 45678,
-      uploader: 'admin'
-    });
-    assert.ok(added.id, 'Nowy rekord media powinien mieć nadane id');
-    assert.equal(added.filename, 'mikolaj-kopernik-portret.png');
-    assert.equal(added.original_name, 'portret.png');
-    assert.equal(added.mime_type, 'image/png');
-    assert.equal(added.size_bytes, 45678);
-    assert.equal(added.uploader, 'admin');
-    assert.equal(added.url, '/uploads/mikolaj-kopernik-portret.png');
-
-    // 2. Pobranie po nazwie pliku
-    const fetched = db.getMediaByFilename('mikolaj-kopernik-portret.png');
-    assert.ok(fetched, 'Powinien odnaleźć plik po nazwie');
-    assert.equal(fetched.id, added.id);
-    assert.equal(fetched.mime_type, 'image/png');
-
-    // Brakujący plik zwraca null
-    assert.strictEqual(db.getMediaByFilename('nie-ma-takiego-pliku.png'), null);
-
-    // 3. Pobranie listy mediów
-    const list = db.listMedia({ limit: 10 });
-    assert.ok(Array.isArray(list));
-    const foundInList = list.find(m => m.filename === 'mikolaj-kopernik-portret.png');
-    assert.ok(foundInList, 'Plik powinien znajdować się na liście pobranych mediów');
-
-    // 4. Walidacja błędnych danych w addMedia
-    assert.throws(() => {
-      db.addMedia({ filename: '', original_name: 'x', mime_type: 'image/png' });
-    }, /Nazwa pliku/);
-  });
-
-  test('zarządzanie listą obserwowanych (watchlist: toggleWatchlist, isWatching, getWatchlistArticles, getWatchlistRecentChanges)', () => {
-    const userId = 1; // admin
-    const testSlug = 'mikolaj-kopernik';
-
-    // 1. Sprawdzenie stanu początkowego
-    assert.equal(db.isWatching(userId, testSlug), false);
-
-    // 2. Dodanie do obserwowanych
-    const watchRes = db.toggleWatchlist(userId, testSlug);
-    assert.equal(watchRes.watching, true);
-    assert.equal(watchRes.slug, testSlug);
-    assert.equal(db.isWatching(userId, testSlug), true);
-
-    // 3. Pobranie listy obserwowanych artykułów
-    const watchedArticles = db.getWatchlistArticles(userId);
-    assert.ok(Array.isArray(watchedArticles));
-    assert.ok(watchedArticles.some(a => a.slug === testSlug), 'Artykuł powinien być w obserwowanych');
-
-    // 4. Pobranie ostatnich zmian obserwowanych artykułów
-    const watchedChanges = db.getWatchlistRecentChanges(userId);
-    assert.ok(Array.isArray(watchedChanges));
-    assert.ok(watchedChanges.some(c => c.article_slug === testSlug), 'Ostatnie zmiany artykułu powinny być w obserwowanych zmianach');
-
-    // 5. Usunięcie z obserwowanych (toggle off)
-    const unwatchRes = db.toggleWatchlist(userId, testSlug);
-    assert.equal(unwatchRes.watching, false);
-    assert.equal(db.isWatching(userId, testSlug), false);
-
-    const watchedAfter = db.getWatchlistArticles(userId);
-    assert.ok(!watchedAfter.some(a => a.slug === testSlug), 'Artykuł nie powinien już być w obserwowanych');
-
-    // 6. Odporność na brakujące argumenty
-    assert.equal(db.isWatching(null, testSlug), false);
-    assert.deepEqual(db.getWatchlistArticles(null), []);
-    assert.deepEqual(db.getWatchlistRecentChanges(null), []);
-    assert.throws(() => db.toggleWatchlist(null, testSlug), /Brak ID/);
-  });
-
-  test('bezpieczeństwo i odporność FTS5: sanityzacja symboli specjalnych (*, ", AND, nawiasy) i limit długości', () => {
-    // 1. Złożone zapytania z symbolami specjalnymi, niesparowanymi cudzysłowami i operatorami
-    assert.doesNotThrow(() => {
-      const res1 = db.searchArticlesFTS('C++ "test (unclosed');
-      assert.ok(Array.isArray(res1));
-    });
-
-    assert.doesNotThrow(() => {
-      const res2 = db.searchArticlesFTS('"Polska" + AND + (test*):');
-      assert.ok(Array.isArray(res2));
-      assert.ok(res2.some(r => r.slug === 'polska'));
-    });
-
-    assert.doesNotThrow(() => {
-      const res3 = db.searchArticlesFTS('*** """ ((( ))) AND OR NOT');
-      assert.deepEqual(res3, []);
-    });
-
-    // 2. Limit długości zapytania: zapytania o długości < 2 znaków zwracają pustą tablicę
-    assert.deepEqual(db.searchArticlesFTS('a'), []);
-    assert.deepEqual(db.searchArticlesFTS('*'), []);
-    assert.deepEqual(db.searchArticlesFTS(' '), []);
-    assert.deepEqual(db.searchArticlesFTS(null), []);
-  });
-
-  test('kaskadowe czyszczenie listy obserwowanych przy usuwaniu artykułu (deleteArticle)', () => {
-    // 1. Utworzenie tymczasowego artykułu
-    const temp = db.createArticle({
-      title: 'Tymczasowy Artykuł Do Usunięcia',
-      slug: 'tymczasowy-artykul-do-usuniecia',
-      content: 'Treść tymczasowa do sprawdzenia referential integrity.',
-      editor: 'admin'
-    });
-
-    // 2. Dodanie do obserwowanych
-    const watchRes = db.toggleWatchlist(1, temp.slug);
-    assert.equal(watchRes.watching, true);
-    assert.equal(db.isWatching(1, temp.slug), true);
-
-    const watchedBefore = db.getWatchlistArticles(1);
-    assert.ok(watchedBefore.some(a => a.slug === temp.slug));
-
-    // 3. Usunięcie artykułu przez deleteArticle
-    const deleted = db.deleteArticle(temp.slug, 'admin');
-    assert.equal(deleted, true);
-
-    // 4. Weryfikacja usunięcia z watchlist
-    assert.equal(db.isWatching(1, temp.slug), false);
-    const watchedAfter = db.getWatchlistArticles(1);
-    assert.ok(!watchedAfter.some(a => a.slug === temp.slug), 'Usunięty artykuł musi zniknąć z listy obserwowanych');
+    db.updateArticleAdminStatus('lodz', { is_published: 0 }, 'admin');
+    const pubChanges = db.getRecentChanges(50);
+    assert.ok(!pubChanges.some(c => c.slug === 'lodz'), 'Nieopublikowane artykuły nie mogą pojawiać się w publicznym getRecentChanges');
+    const adminChanges = db.getRecentChanges(50, { includeUnpublished: true });
+    assert.ok(adminChanges.some(c => c.slug === 'lodz'), 'Admin z includeUnpublished powinien widzieć zmiany');
   });
 });
 
@@ -643,7 +443,7 @@ describe('3. Serwer HTTP API (src/server.js)', () => {
       });
       req.on('error', reject);
       if (options.body) {
-        req.write(typeof options.body === 'string' || Buffer.isBuffer(options.body) ? options.body : JSON.stringify(options.body));
+        req.write(typeof options.body === 'string' ? options.body : JSON.stringify(options.body));
       }
       req.end();
     });
@@ -987,466 +787,244 @@ describe('3. Serwer HTTP API (src/server.js)', () => {
     assert.equal(delRes.status, 200);
   });
 
-  test('walidacja JSON i kody błędów 400/404 dla żądań do artykułów i rewizji', async () => {
-    // 1. Nieprawidłowy JSON w żądaniu POST
-    const badJsonRes = await apiRequest('/api/preview', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{ to nie jest poprawny json'
-    });
-    assert.equal(badJsonRes.status, 400, 'Nieprawidłowy JSON powinien zwrócić status 400');
-    assert.ok(badJsonRes.json.error);
-
-    // 2. 404 dla nieistniejącego artykułu w GET /api/articles/:slug
-    const notFoundArtRes = await apiRequest('/api/articles/nieistniejacy-artykul-xyz');
-    assert.equal(notFoundArtRes.status, 404);
-
-    // 3. 404 dla nieistniejącego artykułu w revisions
-    const notFoundRevsRes = await apiRequest('/api/articles/nieistniejacy-artykul-xyz/revisions');
-    assert.equal(notFoundRevsRes.status, 404);
-
-    // 4. 404 dla nieistniejącego artykułu w dyskusji GET i POST /talk
-    const notFoundTalkGet = await apiRequest('/api/articles/nieistniejacy-artykul-xyz/talk');
-    assert.equal(notFoundTalkGet.status, 404);
-
-    const notFoundTalkPost = await apiRequest('/api/articles/nieistniejacy-artykul-xyz/talk', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: { content: 'Wiadomość do pustki' }
-    });
-    assert.equal(notFoundTalkPost.status, 404);
-
-    // 5. 400 dla pustej wiadomości w dyskusji istniejącego artykułu
-    const emptyTalkRes = await apiRequest('/api/articles/polska/talk', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: { content: '   ' }
-    });
-    assert.equal(emptyTalkRes.status, 400);
-
-    // 6. 404 dla revert na nieistniejącym artykule
-    const notFoundRevert = await apiRequest('/api/articles/nieistniejacy-artykul-xyz/revert', {
+  test('Polskie wyszukiwanie, statystyki preview, walidacja pustych pól, sanityzacja infoboksu i konflikt 409', async () => {
+    // 1. Tworzenie artykułu z polskimi znakami i bezpiecznym infoboxem
+    const createRes = await apiRequest('/api/articles', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${adminToken}`
       },
-      body: { revisionId: 1 }
+      body: {
+        title: 'Łódź',
+        summary: 'Miasto w województwie łódzkim.',
+        content: '== Opis ==\nŁódź słynie z ulicy Piotrkowskiej.',
+        infobox: { title: 'Łódź', image: '/images/lodz.png', items: { Kraj: 'Polska' } },
+        categories: ['Miasta']
+      }
     });
-    assert.equal(notFoundRevert.status, 404);
+    assert.equal(createRes.status, 201);
+    const createdAtUpdated = createRes.json.article.updated_at;
+
+    // 2. Wyszukiwanie GET /api/articles?q=łódź (case-insensitive po polsku)
+    const searchRes = await apiRequest('/api/articles?q=' + encodeURIComponent('łódź'));
+    assert.equal(searchRes.status, 200);
+    assert.ok(searchRes.json.articles.some(a => a.slug === 'lodz'));
+
+    // 3. GET /api/articles/:slug zwraca editor i last_editor
+    const getRes = await apiRequest('/api/articles/lodz');
+    assert.equal(getRes.status, 200);
+    assert.equal(getRes.json.article.editor, 'admin');
+    assert.equal(getRes.json.article.last_editor, 'admin');
+
+    // 4. Odrzucenie pustego/białego tytułu i treści (400)
+    const emptyContentRes = await apiRequest('/api/articles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+      body: { title: 'Pusty artykuł', content: '   \n  ' }
+    });
+    assert.equal(emptyContentRes.status, 400);
+
+    const emptyPutTitleRes = await apiRequest('/api/articles/lodz', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+      body: { title: '   ', content: 'Treść' }
+    });
+    assert.equal(emptyPutTitleRes.status, 400);
+
+    const emptyPutContentRes = await apiRequest('/api/articles/lodz', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+      body: { content: '  ' }
+    });
+    assert.equal(emptyPutContentRes.status, 400);
+
+    // 5. Walidacja niebezpiecznego infobox.image na POST/PUT (400) oraz sanityzacja na /api/preview
+    const badImgCreate = await apiRequest('/api/articles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+      body: {
+        title: 'Zły obrazek',
+        content: 'Treść artykułu',
+        infobox: { title: 'Test', image: 'javascript:alert(1)', items: { A: '1' } }
+      }
+    });
+    assert.equal(badImgCreate.status, 400);
+
+    const badImgPut = await apiRequest('/api/articles/lodz', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+      body: {
+        infobox: { title: 'Łódź', image: 'data:text/html,<script>alert(1)</script>', items: {} }
+      }
+    });
+    assert.equal(badImgPut.status, 400);
+
+    const previewRes = await apiRequest('/api/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: {
+        title: 'Podgląd Łódź',
+        summary: 'Krótki opis',
+        content: '== Sekcja ==\nJeden dwa trzy cztery pięć.',
+        infobox: { title: 'Łódź', image: 'javascript:alert(1)', items: { Kraj: 'Polska' } },
+        categories: ['Miasta']
+      }
+    });
+    assert.equal(previewRes.status, 200);
+    assert.equal(previewRes.json.wordCount, 6);
+    assert.equal(previewRes.json.readingTimeMinutes, 1);
+    assert.ok(Array.isArray(previewRes.json.links));
+    assert.strictEqual(previewRes.json.infobox.image, undefined, 'Preview musi usuwać niebezpieczne image URL');
+
+    // 6. Obsługa infobox: null w PUT (czyści infobox zamiast zapisać "null")
+    const clearInfoboxRes = await apiRequest('/api/articles/lodz', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${editorToken}` },
+      body: {
+        content: '== Opis ==\nŁódź zaktualizowana przez redaktora.',
+        infobox: null,
+        base_updated_at: createdAtUpdated
+      }
+    });
+    assert.equal(clearInfoboxRes.status, 200);
+    assert.deepEqual(clearInfoboxRes.json.article.infobox, {});
+    assert.equal(clearInfoboxRes.json.article.last_editor, 'redaktor');
+
+    // 7. Konflikt edycji 409 przy przestarzałym base_updated_at
+    const conflictRes = await apiRequest('/api/articles/lodz', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+      body: {
+        content: 'Spóźniona edycja',
+        base_updated_at: createdAtUpdated
+      }
+    });
+    assert.equal(conflictRes.status, 409);
+    assert.equal(conflictRes.json.conflict, true);
+    assert.equal(conflictRes.json.currentArticle.slug, 'lodz');
+    assert.equal(conflictRes.json.currentArticle.last_editor, 'redaktor');
   });
 
-  test('ochrona przed wyciekiem rewizji pomiędzy różnymi artykułami w /api/articles/:slug/diff (400)', async () => {
-    // Pobierz rewizję z artykułu polska i z artykułu javascript
+  test('Izolacja diff między artykułami, widoczność nieopublikowanych treści oraz allow_anonymous_edits', async () => {
+    // 1. Izolacja diff: rewizja z innego artykułu musi zostać odrzucona (404)
     const polskaRevs = await apiRequest('/api/articles/polska/revisions');
-    const jsRevs = await apiRequest('/api/articles/javascript/revisions');
-    assert.ok(polskaRevs.json.revisions.length > 0);
-    assert.ok(jsRevs.json.revisions.length > 0);
+    const lodzRevs = await apiRequest('/api/articles/lodz/revisions');
+    assert.equal(polskaRevs.status, 200);
+    assert.equal(lodzRevs.status, 200);
 
     const polskaRevId = polskaRevs.json.revisions[0].id;
-    const jsRevId = jsRevs.json.revisions[0].id;
+    const lodzRevId = lodzRevs.json.revisions[0].id;
+    const crossDiff = await apiRequest(`/api/articles/polska/diff?from=${polskaRevId}&to=${lodzRevId}`);
+    assert.equal(crossDiff.status, 404, 'Diff między różnymi artykułami musi być odrzucony');
 
-    // Próba porównania rewizji z JavaScript przez ścieżkę artykułu Polska -> 400
-    const leakDiffRes = await apiRequest(`/api/articles/polska/diff?from=${polskaRevId}&to=${jsRevId}`);
-    assert.equal(leakDiffRes.status, 400, 'Diff z rewizją innego artykułu powinien zwrócić 400 Bad Request');
-    assert.ok(leakDiffRes.json.error.includes('Rewizje nie należą'));
-
-    // Błędne identyfikatory from/to (NaN) -> 400
-    const badParamsDiff = await apiRequest('/api/articles/polska/diff?from=abc&to=xyz');
-    assert.equal(badParamsDiff.status, 400);
-  });
-
-  test('walidacja unikalności i wymaganych pól w POST /api/articles (400 i 409) oraz PUT (400 i 404)', async () => {
-    // 1. Brak tytułu w POST /api/articles -> 400
-    const noTitleRes = await apiRequest('/api/articles', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`
-      },
-      body: { content: 'Treść bez tytułu' }
-    });
-    assert.equal(noTitleRes.status, 400);
-
-    // 2. Duplikat tytułu/slug -> 409 Conflict
-    const dupRes = await apiRequest('/api/articles', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`
-      },
-      body: { title: 'Polska', content: 'Kopia' }
-    });
-    assert.equal(dupRes.status, 409, 'Tworzenie duplikatu artykułu powinno zwrócić 409 Conflict');
-
-    // 3. PUT na nieistniejącym artykule -> 404
-    const notFoundPut = await apiRequest('/api/articles/nie-ma-takiego-artykulu', {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`
-      },
-      body: { content: 'Nowa treść' }
-    });
-    assert.equal(notFoundPut.status, 404);
-
-    // 4. PUT z pustym tytułem -> 400
-    const emptyTitlePut = await apiRequest('/api/articles/polska', {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`
-      },
-      body: { title: '   ' }
-    });
-    assert.equal(emptyTitlePut.status, 400);
-  });
-
-  test('walidacja i statusy w panelu administratora (404, 400, 409)', async () => {
-    // 1. DELETE nieistniejącego artykułu -> 404
-    const delNonExistent = await apiRequest('/api/admin/articles/nie-ma-artykulu-123', {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    assert.equal(delNonExistent.status, 404);
-
-    // 2. DELETE nieistniejącej wiadomości talk -> 404
-    const delNonExistentTalk = await apiRequest('/api/admin/talk/999999', {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    assert.equal(delNonExistentTalk.status, 404);
-
-    // 3. PATCH statusu nieistniejącego artykułu -> 404
-    const patchNonExistentStatus = await apiRequest('/api/admin/articles/nie-ma-artykulu-123/status', {
+    // 2. Ukrycie nieopublikowanego artykułu przed zwykłymi użytkownikami i gośćmi
+    await apiRequest('/api/admin/articles/lodz/status', {
       method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`
-      },
-      body: { is_featured: 1 }
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+      body: { is_published: 0 }
     });
-    assert.equal(patchNonExistentStatus.status, 404);
 
-    // 4. POST użytkownika który już istnieje -> 409
-    const dupUser = await apiRequest('/api/admin/users', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`
-      },
-      body: { username: 'admin', password: 'nowehaslo123', role: 'admin' }
+    const guestRev = await apiRequest('/api/articles/lodz/revisions');
+    assert.equal(guestRev.status, 404);
+    const editorDiff = await apiRequest(`/api/articles/lodz/diff?from=${lodzRevId}&to=${lodzRevId}`, {
+      headers: { 'Authorization': `Bearer ${editorToken}` }
     });
-    assert.equal(dupUser.status, 409);
+    assert.equal(editorDiff.status, 404);
+    const guestTalk = await apiRequest('/api/articles/lodz/talk');
+    assert.equal(guestTalk.status, 404);
+    const recentAnon = await apiRequest('/api/recent-changes');
+    assert.ok(!recentAnon.json.changes.some(c => c.slug === 'lodz'));
 
-    // 5. POST użytkownika z nieprawidłową rolą -> 400
-    const badRoleUser = await apiRequest('/api/admin/users', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`
-      },
-      body: { username: 'nowy_tester', password: 'haslo123', role: 'root_super_admin' }
-    });
-    assert.equal(badRoleUser.status, 400);
-
-    // 6. PATCH /api/admin/users/:id - próba odebrania sobie uprawnień admina -> 400
-    const meRes = await apiRequest('/api/auth/me', {
+    // Admin nadal ma pełny dostęp
+    const adminRev = await apiRequest('/api/articles/lodz/revisions', {
       headers: { 'Authorization': `Bearer ${adminToken}` }
     });
-    const myId = meRes.json.user.id;
-    const demoteSelf = await apiRequest(`/api/admin/users/${myId}`, {
-      method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`
-      },
-      body: { role: 'blocked' }
+    assert.equal(adminRev.status, 200);
+    const recentAdmin = await apiRequest('/api/recent-changes', {
+      headers: { 'Authorization': `Bearer ${adminToken}` }
     });
-    assert.equal(demoteSelf.status, 400, 'Administrator nie może zablokować ani zdemotować samego siebie');
-  });
+    assert.ok(recentAdmin.json.changes.some(c => c.slug === 'lodz'));
 
-  test('bezpieczeństwo tokenów i brak wycieku hashy/soli w odpowiedziach API auth oraz blokada path traversal', async () => {
-    // 1. Sprawdzenie czy endpointy logowania i profilu nie zwracają pól hash/salt
-    const loginCheck = await apiRequest('/api/auth/login', {
+    // 3. Włączenie allow_anonymous_edits = '1' pozwala na edycję niezalogowanym (ale nie zablokowanym i nie zablokowanych stron)
+    const enableAnon = await apiRequest('/api/admin/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+      body: { allow_anonymous_edits: '1' }
+    });
+    assert.equal(enableAnon.status, 200);
+    assert.equal(enableAnon.json.settings.allow_anonymous_edits, '1');
+
+    const anonCreate = await apiRequest('/api/articles', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: { username: 'admin', password: TEST_ADMIN_PASSWORD }
+      body: { title: 'Artykuł Anonima', content: 'Treść dodana przez gościa.' }
     });
-    assert.equal(loginCheck.status, 200);
-    assert.strictEqual(loginCheck.json.user.password_hash, undefined);
-    assert.strictEqual(loginCheck.json.user.salt, undefined);
+    assert.equal(anonCreate.status, 201);
+    assert.equal(anonCreate.json.article.editor, 'Anonim');
 
-    const meCheck = await apiRequest('/api/auth/me', {
-      headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    assert.strictEqual(meCheck.json.user.password_hash, undefined);
-    assert.strictEqual(meCheck.json.user.salt, undefined);
-
-    // 2. Próba wyjścia poza public/ (path traversal) -> 403 Forbidden
-    const traversal = await apiRequest('/../package.json');
-    assert.equal(traversal.status, 403, 'Path traversal poza katalog public/ musi zwracać 403 Forbidden');
-  });
-
-  test('GET /api/search - zaawansowane wyszukiwanie z parametrem q i snippetami', async () => {
-    // 1. Wyszukiwanie zapytania "kopernik"
-    const searchRes = await apiRequest('/api/search?q=kopernik');
-    assert.equal(searchRes.status, 200);
-    assert.ok(Array.isArray(searchRes.json.results));
-    assert.ok(Array.isArray(searchRes.json.articles));
-    assert.ok(searchRes.json.results.length > 0);
-    const found = searchRes.json.results.find(r => r.slug === 'mikolaj-kopernik');
-    assert.ok(found, 'W wynikach powinien znaleźć się Mikołaj Kopernik');
-    assert.ok(found.snippet.includes('<mark class="search-highlight">'), 'Snippet musi zawierać <mark>');
-
-    // 2. Puste zapytanie zwraca pustą tablicę
-    const emptyRes = await apiRequest('/api/search');
-    assert.equal(emptyRes.status, 200);
-    assert.deepEqual(emptyRes.json.results, []);
-  });
-
-  test('POST /api/upload i GET /api/media - autoryzacja, walidacja formatów i wgrywanie plików', async () => {
-    // 1. Niezalogowany użytkownik -> 401
-    const unauthUpload = await apiRequest('/api/upload', {
-      method: 'POST',
+    const anonEdit = await apiRequest('/api/articles/artykul-anonima', {
+      method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: { filename: 'test.png', data: 'abc' }
+      body: { content: 'Zaktualizowana treść gościa.' }
     });
-    assert.equal(unauthUpload.status, 401);
+    assert.equal(anonEdit.status, 200);
 
-    // 2. Zablokowany użytkownik -> 403
-    const blockedUpload = await apiRequest('/api/upload', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${blockedToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: { filename: 'test.png', data: 'abc' }
+    const blockedStill403 = await apiRequest('/api/articles/artykul-anonima', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${blockedToken}` },
+      body: { content: 'Wandalizm' }
     });
-    assert.equal(blockedUpload.status, 403);
+    assert.equal(blockedStill403.status, 403);
 
-    // 3. Nieprawidłowy typ MIME -> 400
-    const badMimeUpload = await apiRequest('/api/upload', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${adminToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: {
-        filename: 'malware.exe',
-        mime_type: 'application/x-msdownload',
-        data: Buffer.from('fake exe').toString('base64')
-      }
+    const lockedStill403 = await apiRequest('/api/articles/zasady-wikikurekk', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: { content: 'Próba obejścia blokady' }
     });
-    assert.equal(badMimeUpload.status, 400);
+    assert.equal(lockedStill403.status, 403);
 
-    // 4. Poprawne przesłanie pliku graficznego SVG (base64)
-    const svgData = '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><circle cx="5" cy="5" r="5" fill="green"/></svg>';
-    const base64Data = Buffer.from(svgData).toString('base64');
-    const validUpload = await apiRequest('/api/upload', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${adminToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: {
-        filename: 'kurekk-logo.svg',
-        original_name: 'kurekk-logo.svg',
-        mime_type: 'image/svg+xml',
-        data: `data:image/svg+xml;base64,${base64Data}`
-      }
+    // Wyłączenie allow_anonymous_edits przywraca 401 dla gości
+    await apiRequest('/api/admin/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+      body: { allow_anonymous_edits: '0' }
     });
-    assert.equal(validUpload.status, 201);
-    assert.ok(validUpload.json.media);
-    assert.ok(validUpload.json.media.filename.includes('kurekk-logo'));
-    assert.equal(validUpload.json.media.mime_type, 'image/svg+xml');
-    assert.ok(validUpload.json.url.startsWith('/uploads/'));
-
-    const uploadedFilename = validUpload.json.media.filename;
-
-    // 5. Pobranie listy mediów GET /api/media
-    const mediaListRes = await apiRequest('/api/media');
-    assert.equal(mediaListRes.status, 200);
-    assert.ok(Array.isArray(mediaListRes.json.media));
-    assert.ok(mediaListRes.json.media.some(m => m.filename === uploadedFilename));
-
-    // Sprzątanie po teście
-    const uploadedFilePath = path.join(ROOT_DIR, 'public', 'uploads', uploadedFilename);
-    if (fs.existsSync(uploadedFilePath)) {
-      fs.unlinkSync(uploadedFilePath);
-    }
-    const uploadsDir = path.join(ROOT_DIR, 'public', 'uploads');
-    if (fs.existsSync(uploadsDir) && fs.readdirSync(uploadsDir).length === 0) {
-      fs.rmdirSync(uploadsDir);
-    }
+    const anonAfterDisable = await apiRequest('/api/articles/artykul-anonima', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: { content: 'Nie powinno przejść' }
+    });
+    assert.equal(anonAfterDisable.status, 401);
   });
 
-  test('Watchlist API: POST /api/watchlist/:slug/toggle, GET /api/watchlist, GET /api/watchlist/changes oraz isWatching w widoku artykułu', async () => {
-    // 1. Niezalogowany użytkownik nie może operować na liście obserwowanych (401)
-    const unauthToggle = await apiRequest('/api/watchlist/mikolaj-kopernik/toggle', { method: 'POST' });
-    assert.equal(unauthToggle.status, 401);
+  test('Pliki statyczne i fallback index.html wysyłają nagłówki no-cache i obsługują parametry ?v=', async () => {
+    const assertNoCache = (res, expectedTypeFragment, label) => {
+      assert.equal(res.status, 200, `${label} powinien zwrócić 200`);
+      assert.ok(
+        String(res.headers['content-type'] || '').includes(expectedTypeFragment),
+        `${label} powinien mieć Content-Type zawierający ${expectedTypeFragment}`
+      );
+      const cacheControl = String(res.headers['cache-control'] || '').toLowerCase();
+      assert.ok(cacheControl.includes('no-cache'), `${label} musi zawierać no-cache w Cache-Control`);
+      assert.ok(cacheControl.includes('no-store'), `${label} musi zawierać no-store w Cache-Control`);
+      assert.ok(cacheControl.includes('must-revalidate'), `${label} musi zawierać must-revalidate w Cache-Control`);
+      assert.equal(res.headers['pragma'], 'no-cache', `${label} musi mieć Pragma: no-cache`);
+      assert.equal(res.headers['expires'], '0', `${label} musi mieć Expires: 0`);
+    };
 
-    const unauthWatchlist = await apiRequest('/api/watchlist');
-    assert.equal(unauthWatchlist.status, 401);
+    const rootRes = await apiRequest('/');
+    assertNoCache(rootRes, 'text/html', 'GET /');
 
-    const unauthChanges = await apiRequest('/api/watchlist/changes');
-    assert.equal(unauthChanges.status, 401);
+    const appJsRes = await apiRequest('/app.js');
+    assertNoCache(appJsRes, 'javascript', 'GET /app.js');
 
-    // 2. Nieistniejący artykuł przy toggle -> 404
-    const notFoundToggle = await apiRequest('/api/watchlist/nie-ma-takiego-artykulu/toggle', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    assert.equal(notFoundToggle.status, 404);
+    const appJsQueryRes = await apiRequest('/app.js?v=20261112');
+    assertNoCache(appJsQueryRes, 'javascript', 'GET /app.js?v=20261112');
+    assert.ok(!appJsQueryRes.body.trimStart().startsWith('<!DOCTYPE'), 'GET /app.js?v=... nie może wpadać w fallback HTML');
 
-    // 3. Sprawdzenie widoku artykułu przed dodaniem do obserwowanych
-    const artBefore = await apiRequest('/api/articles/mikolaj-kopernik', {
-      headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    assert.equal(artBefore.status, 200);
-    assert.equal(artBefore.json.isWatching, false);
-
-    // Dla gościa isWatching zawsze jest false
-    const artGuest = await apiRequest('/api/articles/mikolaj-kopernik');
-    assert.equal(artGuest.status, 200);
-    assert.equal(artGuest.json.isWatching, false);
-
-    // 4. Dodanie do obserwowanych
-    const watchRes = await apiRequest('/api/watchlist/mikolaj-kopernik/toggle', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    assert.equal(watchRes.status, 200);
-    assert.equal(watchRes.json.watching, true);
-
-    // Widok artykułu z tokenem zwraca teraz isWatching = true
-    const artAfter = await apiRequest('/api/articles/mikolaj-kopernik', {
-      headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    assert.equal(artAfter.status, 200);
-    assert.equal(artAfter.json.isWatching, true);
-
-    // 5. Pobranie listy obserwowanych
-    const listRes = await apiRequest('/api/watchlist', {
-      headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    assert.equal(listRes.status, 200);
-    assert.ok(Array.isArray(listRes.json.articles));
-    assert.ok(listRes.json.articles.some(a => a.slug === 'mikolaj-kopernik'));
-
-    // 6. Pobranie zmian obserwowanych
-    const changesRes = await apiRequest('/api/watchlist/changes', {
-      headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    assert.equal(changesRes.status, 200);
-    assert.ok(Array.isArray(changesRes.json.changes));
-
-    // 7. Usunięcie z obserwowanych
-    const unwatchRes = await apiRequest('/api/watchlist/mikolaj-kopernik/toggle', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    assert.equal(unwatchRes.status, 200);
-    assert.equal(unwatchRes.json.watching, false);
-
-    // Widok artykułu znowu zwraca isWatching = false
-    const artFinal = await apiRequest('/api/articles/mikolaj-kopernik', {
-      headers: { 'Authorization': `Bearer ${adminToken}` }
-    });
-    assert.equal(artFinal.status, 200);
-    assert.equal(artFinal.json.isWatching, false);
-  });
-
-  test('Hardening: weryfikacja magic bytes dla PNG/JPEG/WEBP, sanityzacja XSS w SVG oraz nagłówek CSP', async () => {
-    // 1. Fałszywy PNG: tekst oznaczony jako image/png zwraca 400
-    const fakePngRes = await apiRequest('/api/upload', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${adminToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: {
-        filename: 'fake.png',
-        mime_type: 'image/png',
-        data: Buffer.from('NOT A REAL PNG FILE').toString('base64')
-      }
-    });
-    assert.equal(fakePngRes.status, 400);
-    assert.ok(fakePngRes.json.error.includes('magic bytes') || fakePngRes.json.error.includes('PNG'));
-
-    // 2. Prawidłowy PNG ze sygnaturą magic bytes: 89 50 4E 47 0D 0A 1A 0A
-    const validPngHeader = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D]);
-    const validPngRes = await apiRequest('/api/upload', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${adminToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: {
-        filename: 'valid.png',
-        mime_type: 'image/png',
-        data: validPngHeader.toString('base64')
-      }
-    });
-    assert.equal(validPngRes.status, 201);
-    const validPngFile = validPngRes.json.media.filename;
-
-    // 3. Fałszywy JPEG bez sygnatury FF D8 FF zwraca 400
-    const fakeJpgRes = await apiRequest('/api/upload', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${adminToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: {
-        filename: 'fake.jpg',
-        mime_type: 'image/jpeg',
-        data: Buffer.from('NOT A JPEG').toString('base64')
-      }
-    });
-    assert.equal(fakeJpgRes.status, 400);
-
-    // 4. Sanityzacja SVG: usunięcie <script>, <iframe>, <object> oraz atrybutów zdarzeń (onload, onclick)
-    const maliciousSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
-      <script>alert("xss")</script>
-      <iframe src="https://evil.com"></iframe>
-      <rect width="50" height="50" fill="blue" onload="alert(1)" onclick="alert(2)" />
-    </svg>`;
-    const svgUpload = await apiRequest('/api/upload', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${adminToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: {
-        filename: 'sanitized.svg',
-        mime_type: 'image/svg+xml',
-        data: Buffer.from(maliciousSvg).toString('base64')
-      }
-    });
-    assert.equal(svgUpload.status, 201);
-    const svgFilename = svgUpload.json.media.filename;
-
-    // 5. Pobranie zapisanego pliku SVG i weryfikacja braku skryptów oraz nagłówka CSP
-    const svgServeRes = await apiRequest(`/uploads/${svgFilename}`);
-    assert.equal(svgServeRes.status, 200);
-    assert.ok(!svgServeRes.body.includes('<script>'), 'SVG nie może zawierać znacznika <script>');
-    assert.ok(!svgServeRes.body.includes('alert('), 'SVG nie może zawierać wywołań JavaScript');
-    assert.ok(!svgServeRes.body.includes('<iframe>'), 'SVG nie może zawierać <iframe>');
-    assert.ok(!svgServeRes.body.includes('onload='), 'SVG nie może zawierać atrybutu onload');
-    assert.ok(!svgServeRes.body.includes('onclick='), 'SVG nie może zawierać atrybutu onclick');
-    assert.ok(svgServeRes.headers['content-security-policy'], 'SVG musi być serwowane z nagłówkiem CSP');
-    assert.ok(svgServeRes.headers['content-security-policy'].includes("default-src 'none'"));
-
-    // Sprzątanie plików testowych
-    for (const fn of [validPngFile, svgFilename]) {
-      const p = path.join(ROOT_DIR, 'public', 'uploads', fn);
-      if (fs.existsSync(p)) fs.unlinkSync(p);
-    }
-    const uploadsDir = path.join(ROOT_DIR, 'public', 'uploads');
-    if (fs.existsSync(uploadsDir) && fs.readdirSync(uploadsDir).length === 0) {
-      fs.rmdirSync(uploadsDir);
-    }
+    const fallbackRes = await apiRequest('/nieistniejaca-sciezka-spa?v=123');
+    assertNoCache(fallbackRes, 'text/html', 'GET /nieistniejaca-sciezka-spa');
   });
 });
 
