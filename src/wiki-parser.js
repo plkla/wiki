@@ -56,6 +56,60 @@ function escapeHtml(str) {
 }
 
 /**
+ * Renderuje znaczniki obrazów [[Plik:...]] oraz [[File:...]] do semantycznego <figure>.
+ * @param {string} rawInner
+ * @returns {string}
+ */
+function renderFigure(rawInner) {
+  const parts = String(rawInner || '').split('|').map(p => p.trim());
+  const filename = parts[0] || '';
+  if (!filename) return '';
+
+  let isThumb = false;
+  let align = '';
+  let caption = '';
+
+  for (let i = 1; i < parts.length; i++) {
+    const part = parts[i];
+    const lower = part.toLowerCase();
+    if (lower === 'miniaturka' || lower === 'thumb' || lower === 'thumbnail') {
+      isThumb = true;
+    } else if (lower === 'prawo' || lower === 'right') {
+      align = 'right';
+    } else if (lower === 'lewo' || lower === 'left') {
+      align = 'left';
+    } else if (lower === 'środek' || lower === 'srodek' || lower === 'center') {
+      align = 'center';
+    } else {
+      caption = part;
+    }
+  }
+
+  const classes = ['wiki-figure'];
+  if (isThumb) classes.push('wiki-figure-thumb');
+  if (align) {
+    classes.push(`wiki-figure-${align}`);
+  } else if (isThumb) {
+    classes.push('wiki-figure-right');
+  }
+
+  const cleanFilename = filename.replace(/^(\.\.[\/\\])+/, '');
+  const src = cleanFilename.startsWith('/') || cleanFilename.startsWith('http')
+    ? cleanFilename
+    : `/uploads/${cleanFilename}`;
+
+  const escapedSrc = escapeHtml(src);
+  const escapedCaption = escapeHtml(caption);
+  const escapedAlt = escapedCaption || escapeHtml(cleanFilename);
+
+  const captionHtml = caption
+    ? `<figcaption class="wiki-figcaption">${escapedCaption}</figcaption>`
+    : '';
+
+  return `<figure class="${classes.join(' ')}"><a href="${escapedSrc}" target="_blank"><img src="${escapedSrc}" alt="${escapedAlt}" /></a>${captionHtml}</figure>`;
+}
+
+/**
  * Renderuje elementy inline (pogrubienie, kursywa, kod, linki wiki).
  * @param {string} text Escapowany tekst
  * @param {Set<string>} slugSet
@@ -73,7 +127,12 @@ function renderInline(text, slugSet, linksOut) {
     return token;
   });
 
-  // 2. Linki wiki: [[Cel|Etykieta]] lub [[Cel]]
+  // 2. Grafiki wiki: [[Plik:...]] lub [[File:...]] (przetwarzane przed linkami wiki)
+  res = res.replace(/\[\[(?:Plik|File):([^\]\n]+)\]\]/gi, (match, inner) => {
+    return renderFigure(inner);
+  });
+
+  // 3. Linki wiki: [[Cel|Etykieta]] lub [[Cel]]
   res = res.replace(/\[\[([^\]\n|]+)(?:\|([^\]\n]+))?\]\]/g, (match, targetRaw, labelRaw) => {
     const target = targetRaw.trim();
     const label = (labelRaw !== undefined ? labelRaw : target).trim();
@@ -220,6 +279,14 @@ function renderWikiContent(rawText, existingSlugsSet = new Set()) {
     if (/^@@@CODEBLOCK_\d+@@@$/.test(line)) {
       flushAll();
       renderedBlocks.push(line);
+      continue;
+    }
+
+    // Samodzielna grafika blokowa [[Plik:...]] lub [[File:...]]
+    const imageBlockMatch = line.match(/^\[\[(?:Plik|File):([^\]]+)\]\]$/i);
+    if (imageBlockMatch) {
+      flushAll();
+      renderedBlocks.push(renderFigure(imageBlockMatch[1]));
       continue;
     }
 
@@ -438,5 +505,6 @@ function computeLineDiff(oldText, newText) {
 module.exports = {
   slugify,
   renderWikiContent,
-  computeLineDiff
+  computeLineDiff,
+  renderFigure
 };

@@ -1,0 +1,12 @@
+{
+  "name": "wiki-kurekk",
+  "version": "1.0.0",
+  "description": "WikiKurekk - Lekka encyklopedia wiki z systemem rewizji i dyskusji",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test tests/wiki.test.js tests/e2e.test.js",
+    "test:unit": "node --test tests/wiki.test.js",
+    "test:e2e": "node --test tests/e2e.test.js"
+  }
+}

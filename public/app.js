@@ -6,9 +6,45 @@
 (function () {
   'use strict';
 
+  // --- Bezpieczna obsługa localStorage z obsługą QuotaExceededError ---
+  function safeGetStorage(key) {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  }
+
+  function safeSetStorage(key, value) {
+    try {
+      localStorage.setItem(key, value);
+    } catch (e) {
+      // W przypadku przepełnienia limitu storage usuwamy starsze wersje robocze wiki_draft_* i ponawiamy
+      try {
+        const draftKeys = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith('wiki_draft_') && k !== key) {
+            draftKeys.push(k);
+          }
+        }
+        draftKeys.forEach(k => {
+          try { localStorage.removeItem(k); } catch {}
+        });
+        localStorage.setItem(key, value);
+      } catch {}
+    }
+  }
+
+  function safeRemoveStorage(key) {
+    try {
+      localStorage.removeItem(key);
+    } catch {}
+  }
+
   // --- Stan aplikacji ---
   const state = {
-    token: localStorage.getItem('wiki_token') || '',
+    token: safeGetStorage('wiki_token') || '',
     currentUser: null,
     settings: {
       site_name: 'WikiKurekk',
@@ -27,7 +63,7 @@
     activeSlug: null,
     adminActiveTab: 'kpi',
     currentRoute: null,
-    theme: localStorage.getItem('wiki_theme') || 'light'
+    theme: safeGetStorage('wiki_theme') || 'light'
   };
 
   // Referencja do ostatniego elementu, który otworzył modal (dla dostępności)
@@ -38,7 +74,7 @@
     const clean = theme === 'dark' ? 'dark' : 'light';
     state.theme = clean;
     document.documentElement.setAttribute('data-theme', clean);
-    localStorage.setItem('wiki_theme', clean);
+    safeSetStorage('wiki_theme', clean);
     const btn = document.getElementById('theme-toggle-btn');
     if (btn) {
       btn.textContent = clean === 'dark' ? 'Jasny motyw' : 'Ciemny motyw';
@@ -93,6 +129,61 @@
       return clean;
     }
     return '';
+  }
+
+  // Bezpieczne renderowanie snippetów wyszukiwania FTS5 z zachowaniem tagów <mark>
+  function renderSearchSnippet(snippet) {
+    if (!snippet) return '';
+    return escapeHtml(snippet)
+      .replace(/&lt;mark(?:\s+class=&quot;([^&]*)&quot;)?&gt;/gi, '<mark class="search-highlight">')
+      .replace(/&lt;\/mark&gt;/gi, '</mark>');
+  }
+
+  // Generowanie sluga zgodne z wiki-parser.js
+  function slugify(text) {
+    if (text == null) return '';
+    const str = String(text).trim();
+    if (!str) return '';
+
+    const polishMap = {
+      'ą': 'a', 'Ą': 'a',
+      'ć': 'c', 'Ć': 'c',
+      'ę': 'e', 'Ę': 'e',
+      'ł': 'l', 'Ł': 'l',
+      'ń': 'n', 'Ń': 'n',
+      'ó': 'o', 'Ó': 'o',
+      'ś': 's', 'Ś': 's',
+      'ź': 'z', 'Ź': 'z',
+      'ż': 'z', 'Ż': 'z',
+      'ß': 'ss',
+      'ø': 'o', 'Ø': 'o',
+      'đ': 'd', 'Đ': 'd'
+    };
+
+    const replaced = str.replace(/[ąćęłńóśźżĄĆĘŁŃÓŚŹŻßøØđĐ]/g, char => polishMap[char] || char);
+
+    return replaced
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+  }
+
+  // Przełączanie globalnego trybu Zen
+  function toggleZenMode(force) {
+    const isZen = force !== undefined ? force : !document.body.classList.contains('editor-zen-active');
+    if (isZen) {
+      document.body.classList.add('editor-zen-active');
+    } else {
+      document.body.classList.remove('editor-zen-active');
+    }
+    const btn = document.getElementById('zen-toggle-btn');
+    if (btn) {
+      btn.innerHTML = isZen ? '✕ Wyjdź z Zen' : '⛶ Tryb Zen';
+      btn.setAttribute('aria-pressed', isZen ? 'true' : 'false');
+    }
+    return isZen;
   }
 
   // --- Pomocnicze funkcje kategorii ---
@@ -210,14 +301,14 @@
   function setAuthToken(token, user = null) {
     state.token = token;
     state.currentUser = user;
-    localStorage.setItem('wiki_token', token);
+    safeSetStorage('wiki_token', token);
     updateHeaderAndSidebar();
   }
 
   function clearAuthToken() {
     state.token = '';
     state.currentUser = null;
-    localStorage.removeItem('wiki_token');
+    safeRemoveStorage('wiki_token');
     updateHeaderAndSidebar();
   }
 
@@ -248,18 +339,21 @@
     const authModalBtn = document.getElementById('auth-modal-btn');
     const registerModalBtn = document.getElementById('register-modal-btn');
     const navAdminTop = document.getElementById('nav-admin-top');
+    const navWatchlistTop = document.getElementById('nav-watchlist-top');
 
     if (userBadgeEl) {
       if (state.currentUser) {
         userBadgeEl.textContent = state.currentUser.username;
         userBadgeEl.classList.remove('hidden');
         if (logoutBtn) logoutBtn.classList.remove('hidden');
+        if (navWatchlistTop) navWatchlistTop.classList.remove('hidden');
         if (authModalBtn) authModalBtn.classList.add('hidden');
         if (registerModalBtn) registerModalBtn.classList.add('hidden');
       } else {
         userBadgeEl.textContent = '';
         userBadgeEl.classList.add('hidden');
         if (logoutBtn) logoutBtn.classList.add('hidden');
+        if (navWatchlistTop) navWatchlistTop.classList.add('hidden');
         if (authModalBtn) authModalBtn.classList.remove('hidden');
         if (registerModalBtn) registerModalBtn.classList.remove('hidden');
       }
@@ -617,7 +711,7 @@
     }
   }
 
-  // --- WIDOK 2: Artykuł (#/wiki/:slug) ---
+  // --- WIDOK 2: Artykuł (#/wiki/:slug) z obsługą Watchlist ---
   async function renderArticleView(slug) {
     const viewRoot = document.getElementById('view-root');
     viewRoot.classList.add('view-fade-in');
@@ -629,6 +723,16 @@
       setPageTitle(art.title);
       updateArticleTabs(slug, 'read', data.revisionsCount, data.talkCount);
 
+      // Sprawdzenie statusu obserwowania artykułu (jeśli zalogowany)
+      let isWatching = Boolean(data.isWatching);
+      if (state.currentUser && data.isWatching === undefined) {
+        try {
+          const wl = await api('/api/watchlist').catch(() => null);
+          const watchedList = (wl && (wl.watchlist || wl.articles)) ? (wl.watchlist || wl.articles) : [];
+          isWatching = watchedList.some(item => (item.slug === slug || item.article_slug === slug));
+        } catch {}
+      }
+
       const badgesHtml = [];
       if (art.is_locked) badgesHtml.push('<span class="status-pill locked badge-locked">🔒 Zabezpieczony</span>');
       if (art.is_featured) badgesHtml.push('<span class="status-pill featured badge-featured">⭐ Wyróżniony</span>');
@@ -639,9 +743,16 @@
       viewRoot.innerHTML = `
         <article class="wiki-article">
           <header class="wiki-article-header">
-            <div class="title-row">
-              <h1 class="wiki-article-title">${escapeHtml(art.title)}</h1>
-              <div class="wiki-badges">${badgesHtml.join(' ')}</div>
+            <div class="title-row" style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px;">
+              <div>
+                <h1 class="wiki-article-title">${escapeHtml(art.title)}</h1>
+                <div class="wiki-badges">${badgesHtml.join(' ')}</div>
+              </div>
+              <div class="article-header-actions">
+                <button type="button" class="btn btn-sm btn-outline btn-watch ${isWatching ? 'btn-watching' : ''}" id="article-watch-btn" title="${isWatching ? 'Przestań obserwować' : 'Dodaj do obserwowanych'}">
+                  ${isWatching ? '★ Obserwowane' : '☆ Obserwuj'}
+                </button>
+              </div>
             </div>
             <div class="wiki-article-meta">
               <span>👁️ Wyświetlenia: <strong>${art.views || 0}</strong></span>
@@ -669,6 +780,35 @@
           ` : ''}
         </article>
       `;
+
+      // Obsługa przycisku Obserwuj (Watchlist) - blokada przed podwójnym kliknięciem
+      const watchBtn = document.getElementById('article-watch-btn');
+      if (watchBtn) {
+        watchBtn.addEventListener('click', async () => {
+          if (!state.currentUser) {
+            showToast('Zaloguj się, aby dodać artykuł do obserwowanych', 'info');
+            openAuthModal('login');
+            return;
+          }
+
+          watchBtn.disabled = true;
+          try {
+            const res = await api(`/api/watchlist/${encodeURIComponent(slug)}/toggle`, {
+              method: 'POST'
+            });
+            const nowWatching = res.watching !== undefined ? res.watching : (res.isWatching !== undefined ? res.isWatching : !isWatching);
+            isWatching = nowWatching;
+            watchBtn.classList.toggle('btn-watching', nowWatching);
+            watchBtn.textContent = nowWatching ? '★ Obserwowane' : '☆ Obserwuj';
+            watchBtn.title = nowWatching ? 'Przestań obserwować' : 'Dodaj do obserwowanych';
+            showToast(nowWatching ? `Dodano „${art.title}” do obserwowanych` : `Usunięto „${art.title}” z obserwowanych`, 'success');
+          } catch (err) {
+            showToast(err.message, 'error');
+          } finally {
+            watchBtn.disabled = false;
+          }
+        });
+      }
 
     } catch (err) {
       updateArticleTabs(null);
@@ -698,9 +838,134 @@
     }
   }
 
-  // --- WIDOK 3 i 4: Edytor Artykułu (#/wiki/:slug/edit oraz #/new) ---
+  // --- WIDOK 2b: Lista Obserwowanych (#/watchlist) ---
+  async function renderWatchlistView() {
+    updateArticleTabs(null);
+    setPageTitle('Obserwowane artykuły');
+    const viewRoot = document.getElementById('view-root');
+    viewRoot.classList.add('view-fade-in');
+
+    if (!state.currentUser) {
+      viewRoot.innerHTML = `
+        <div class="admin-auth-guard">
+          <h2>⭐ Lista obserwowanych haseł</h2>
+          <p>Aby zarządzać obserwowanymi artykułami i śledzić najnowsze zmiany, musisz się zalogować.</p>
+          <button type="button" id="watchlist-login-btn" class="btn btn-primary">Zaloguj się</button>
+        </div>
+      `;
+      document.getElementById('watchlist-login-btn')?.addEventListener('click', () => openAuthModal('login'));
+      return;
+    }
+
+    viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie listy obserwowanych artykułów...</div>';
+
+    try {
+      const [wlData, changesData] = await Promise.all([
+        api('/api/watchlist').catch(() => ({ watchlist: [] })),
+        api('/api/watchlist/changes').catch(() => ({ changes: [] }))
+      ]);
+
+      const watchlist = wlData.watchlist || wlData.articles || [];
+      const changes = changesData.changes || [];
+
+      viewRoot.innerHTML = `
+        <div class="watchlist-page">
+          <header class="watchlist-header" style="margin-bottom:20px;">
+            <h1>⭐ Obserwowane artykuły</h1>
+            <p>Śledź edycje i aktywność w wybranych przez Ciebie hasłach encyklopedii (${watchlist.length}).</p>
+          </header>
+
+          <div class="watchlist-layout" style="display:grid; grid-template-columns: 1fr 1fr; gap:24px; align-items:start;">
+            <!-- Kolumna 1: Zapisane artykuły -->
+            <section class="watchlist-articles-section">
+              <h2>Zapisane hasła (${watchlist.length})</h2>
+              ${watchlist.length === 0 ? `
+                <div class="catalog-empty" style="padding:20px;">
+                  <p>Nie obserwujesz jeszcze żadnych artykułów.</p>
+                  <p style="font-size:0.88rem; color:var(--wiki-text-muted);">Kliknij przycisk <strong>☆ Obserwuj</strong> na szczycie dowolnego artykułu, aby dodać go do tej listy.</p>
+                </div>
+              ` : `
+                <div class="watchlist-list" style="display:flex; flex-direction:column; gap:10px;">
+                  ${watchlist.map(art => {
+                    const slug = art.slug || art.article_slug;
+                    const title = art.title || slug;
+                    return `
+                      <div class="watchlist-item" style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; border:1px solid var(--wiki-border); border-radius:4px; background:var(--wiki-content-bg);">
+                        <div>
+                          <strong><a href="#/wiki/${encodeURIComponent(slug)}">${escapeHtml(title)}</a></strong>
+                          ${art.summary ? `<div style="font-size:0.83rem; color:var(--wiki-text-muted);">${escapeHtml(art.summary)}</div>` : ''}
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline unwatch-btn" data-slug="${encodeURIComponent(slug)}" title="Usuń z listy">
+                          ✕ Usuń
+                        </button>
+                      </div>
+                    `;
+                  }).join('')}
+                </div>
+              `}
+            </section>
+
+            <!-- Kolumna 2: Ostatnia aktywność w obserwowanych -->
+            <section class="watchlist-changes-section">
+              <h2>Ostatnie zmiany w obserwowanych (${changes.length})</h2>
+              ${changes.length === 0 ? `
+                <p style="color:var(--wiki-text-muted);">Brak ostatnich edycji w Twoich obserwowanych artykułach.</p>
+              ` : `
+                <div class="recent-changes-feed">
+                  ${changes.map(ch => {
+                    const slug = ch.slug || ch.article_slug;
+                    const title = ch.title || slug;
+                    return `
+                      <div class="recent-change-row">
+                        <div class="change-time">${formatDate(ch.created_at)}</div>
+                        <div class="change-main">
+                          <span class="change-art-title"><a href="#/wiki/${encodeURIComponent(slug)}">${escapeHtml(title)}</a></span>
+                          <span class="change-author">przez <strong>${escapeHtml(ch.editor || 'Anonim')}</strong></span>
+                          <div class="change-comment"><em>„${escapeHtml(ch.edit_comment || 'Aktualizacja treści')}”</em></div>
+                        </div>
+                        <div class="change-links">
+                          <a href="#/wiki/${encodeURIComponent(slug)}/history" class="btn btn-sm btn-outline">Historia</a>
+                        </div>
+                      </div>
+                    `;
+                  }).join('')}
+                </div>
+              `}
+            </section>
+          </div>
+        </div>
+      `;
+
+      // Handlery usuwania z listy z zabezpieczeniem disabled
+      document.querySelectorAll('.unwatch-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const slug = btn.dataset.slug;
+          btn.disabled = true;
+          try {
+            await api(`/api/watchlist/${slug}/toggle`, { method: 'POST' });
+            showToast('Usunięto artykuł z obserwowanych', 'info');
+            renderWatchlistView();
+          } catch (err) {
+            btn.disabled = false;
+            showToast(err.message, 'error');
+          }
+        });
+      });
+
+    } catch (err) {
+      viewRoot.innerHTML = `
+        <div class="wiki-error">
+          <p>Błąd wczytywania listy obserwowanych: ${escapeHtml(err.message)}</p>
+          <a href="#/" class="btn btn-secondary">Powrót na stronę główną</a>
+        </div>
+      `;
+    }
+  }
+
+  // --- WIDOK 3 i 4: Edytor Artykułu (#/wiki/:slug/edit oraz #/new) z Split-Screen, Auto-save i Wykrywaniem Konfliktów ---
   async function renderArticleEditor(slug = null, initialTitle = '') {
     const isNew = !slug;
+    const draftStorageKey = 'wiki_draft_' + (slug || 'new');
     const viewRoot = document.getElementById('view-root');
     viewRoot.classList.add('view-fade-in');
 
@@ -729,7 +994,8 @@
       content: '',
       infobox: { title: '', items: {} },
       categories: [],
-      is_locked: 0
+      is_locked: 0,
+      updated_at: null
     };
 
     if (!isNew) {
@@ -746,6 +1012,29 @@
     } else {
       setPageTitle(initialTitle ? `Nowy artykuł: ${initialTitle}` : 'Tworzenie nowego artykułu');
       updateArticleTabs(null);
+    }
+
+    // Sprawdzenie obecności lokalnej kopii roboczej i ewentualnego konfliktu z wersją serwerową
+    let savedDraft = null;
+    let hasDraftConflict = false;
+    let isDraftNewer = false;
+
+    const rawDraft = safeGetStorage(draftStorageKey);
+    if (rawDraft) {
+      try {
+        const parsedDraft = JSON.parse(rawDraft);
+        if (parsedDraft && parsedDraft.content && (parsedDraft.content !== currentArticle.content || parsedDraft.title !== currentArticle.title)) {
+          savedDraft = parsedDraft;
+          const draftTime = Number(parsedDraft.savedAt || parsedDraft.timestamp || 0);
+          const serverTime = currentArticle.updated_at ? new Date(currentArticle.updated_at).getTime() : 0;
+
+          if (serverTime > 0 && draftTime > 0 && serverTime > draftTime) {
+            hasDraftConflict = true;
+          } else {
+            isDraftNewer = true;
+          }
+        }
+      } catch {}
     }
 
     // Normalizacja infoboxu
@@ -772,84 +1061,272 @@
 
     viewRoot.innerHTML = `
       <div class="editor-container">
-        <header class="editor-header">
-          <h1>${isNew ? '➕ Tworzenie nowego artykułu' : `✏️ Edycja: ${escapeHtml(currentArticle.title)}`}</h1>
-          <p class="editor-lead">Formatuj treść w składni wikikodu (np. <code>== Nagłówek ==</code>, <code>'''pogrubienie'''</code>, <code>[[Link]]</code>, <code>&lt;ref&gt;źródło&lt;/ref&gt;</code>). Skrót <strong>Ctrl+S</strong> zapisuje stronę.</p>
+        <!-- Alert konfliktu wersji lub przywracania wersji roboczej -->
+        ${hasDraftConflict ? `
+          <div id="draft-conflict-banner" class="alert alert-warning draft-conflict-warning" style="margin-bottom:16px;" role="alert">
+            <div class="draft-conflict-text">
+              ⚠️ <strong>Wykryto konflikt wersji:</strong> Artykuł został zmieniony na serwerze po utworzeniu Twojego lokalnego szkicu. Wybierz wersję roboczą lub wersję z serwera.
+              <div class="draft-conflict-meta" style="font-size:0.83rem; margin-top:3px; color:var(--wiki-text-muted);">
+                Lokalny szkic: ${formatDate(savedDraft.savedAt || savedDraft.timestamp)} &middot; Wersja serwera: ${formatDate(currentArticle.updated_at)}
+              </div>
+            </div>
+            <div class="draft-action-btns" style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+              <button type="button" id="draft-use-local-btn" class="btn btn-sm btn-primary">Użyj lokalnego szkicu</button>
+              <button type="button" id="draft-use-server-btn" class="btn btn-sm btn-outline">Użyj wersji z serwera (odrzuć szkic)</button>
+            </div>
+          </div>
+        ` : (isDraftNewer ? `
+          <div id="draft-restore-banner" class="alert alert-info draft-restore-alert draft-alert" style="margin-bottom:16px;" role="alert">
+            <div class="draft-restore-text">
+              💾 <strong>Wersja robocza:</strong> Dostępna jest automatycznie zachowana kopia z dnia ${formatDate(savedDraft.savedAt || savedDraft.timestamp)}.
+            </div>
+            <div class="draft-action-btns" style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+              <button type="button" id="draft-restore-btn" class="btn btn-sm btn-primary">Przywróć wersję roboczą</button>
+              <button type="button" id="draft-dismiss-btn" class="btn btn-sm btn-outline">Odrzuć</button>
+            </div>
+          </div>
+        ` : '')}
+
+        <!-- Górny zunifikowany panel sterowania (Header & Action Bar) -->
+        <header class="editor-header editor-card">
+          <div class="editor-header-main">
+            <div class="editor-title-group">
+              <div class="editor-title-row">
+                <h1>${isNew ? '➕ Tworzenie nowego artykułu' : `✏️ Edycja: ${escapeHtml(currentArticle.title)}`}</h1>
+                <span class="slug-preview-badge" id="editor-slug-preview">#/wiki/...</span>
+              </div>
+              <div class="editor-header-metrics">
+                <span class="word-counter-badge" id="editor-word-count">0 słów</span>
+                <span class="char-counter-badge" id="editor-char-count">0 znaków</span>
+                <span class="reading-time-badge" id="editor-reading-time">~0 min czytania</span>
+                <span class="editor-autosave-status" id="editor-autosave-indicator">💾 Szkic gotowy</span>
+              </div>
+            </div>
+
+            <!-- Przyciski akcji zawsze pod ręką w nagłówku -->
+            <div class="editor-header-actions">
+              <div class="editor-mode-bar" role="toolbar" aria-label="Wybierz układ edytora">
+                <button type="button" class="btn btn-sm editor-mode-btn active" data-mode="split" title="Edytor i podgląd na żywo obok siebie">Podzielony</button>
+                <button type="button" class="btn btn-sm editor-mode-btn" data-mode="editor" title="Tylko edytor">Tylko edytor</button>
+                <button type="button" class="btn btn-sm editor-mode-btn" data-mode="preview" title="Tylko podgląd">Tylko podgląd</button>
+              </div>
+              <button type="button" id="zen-toggle-btn" class="btn btn-sm btn-outline zen-toggle-btn toolbar-icon-btn" title="Tryb skupienia Zen (Alt+Z)" aria-label="Tryb Zen (Alt+Z)">
+                ⛶ Zen
+              </button>
+              <button type="button" id="editor-top-save-btn" class="btn btn-sm btn-primary" ${isLockedAndNotAdmin ? 'disabled title="Artykuł zabezpieczony"' : ''}>
+                💾 ${isNew ? 'Utwórz artykuł' : 'Zapisz'}
+              </button>
+            </div>
+          </div>
+
           ${isLockedAndNotAdmin ? `
-            <div class="alert alert-warning" role="alert">
+            <div class="alert alert-warning" role="alert" style="margin-top:12px;">
               🔒 <strong>Artykuł zabezpieczony:</strong> Ten artykuł może edytować wyłącznie administrator. Pola edycyjne zostały zablokowane.
             </div>
           ` : ''}
         </header>
 
-        <form id="article-editor-form" class="editor-form">
-          <div class="form-group">
-            <label for="edit-title">Tytuł hasła: <span class="required">*</span></label>
-            <input type="text" id="edit-title" class="form-control" value="${escapeHtml(currentArticle.title)}" placeholder="Np. Komputer kwantowy" required ${isLockedAndNotAdmin ? 'disabled' : ''} />
+        <!-- Kontener z układem Split-Screen -->
+        <div class="editor-split-container" id="editor-split-container">
+          <!-- Lewy panel: Formularz edytora -->
+          <div class="editor-split-pane" id="editor-left-pane">
+            <form id="article-editor-form" class="editor-form">
+
+              <!-- Karta 1: Tytuł i Główna Treść (Core Writing Workspace) -->
+              <div class="editor-card editor-main-card">
+                <div class="form-group editor-title-field">
+                  <label for="edit-title" class="editor-field-label">Tytuł hasła: <span class="required">*</span></label>
+                  <input type="text" id="edit-title" class="form-control editor-title-input" value="${escapeHtml(currentArticle.title || initialTitle)}" placeholder="Wpisz tytuł artykułu (np. Mikołaj Kopernik)..." required ${isLockedAndNotAdmin ? 'disabled' : ''} />
+                </div>
+
+                <!-- Przyklejony pasek narzędzi formatowania ze stylizowanymi ikonami SVG -->
+                <div class="editor-toolbar sticky-toolbar" role="toolbar" aria-label="Narzędzia formatowania">
+                  <div class="toolbar-btn-group">
+                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="heading" title="Nagłówek sekcji H2 (==)" aria-label="Nagłówek H2">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h8m-8-6v12m8-12v12m7 0h4m-4-6h2a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-2"/></svg>
+                      <span>H2</span>
+                    </button>
+                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="subheading" title="Podsekcja H3 (===)" aria-label="Podnagłówek H3">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h8m-8-6v12m8-12v12m6-6h3a2 2 0 0 1 0 4h-2m2 0a2 2 0 0 1 0 4h-3"/></svg>
+                      <span>H3</span>
+                    </button>
+                  </div>
+                  <div class="toolbar-divider" aria-hidden="true"></div>
+                  <div class="toolbar-btn-group">
+                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="bold" title="Pogrubienie ('''tekst''') (Ctrl+B)" aria-label="Pogrubienie">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/><path d="M6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/></svg>
+                      <span>B</span>
+                    </button>
+                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="italic" title="Kursywa (''tekst'') (Ctrl+I)" aria-label="Kursywa">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="19" y1="4" x2="10" y2="4"/><line x1="14" y1="20" x2="5" y2="20"/><line x1="15" y1="4" x2="9" y2="20"/></svg>
+                      <span>I</span>
+                    </button>
+                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="code" title="Kod inline (\`kod\`)" aria-label="Kod">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+                      <span>Kod</span>
+                    </button>
+                  </div>
+                  <div class="toolbar-divider" aria-hidden="true"></div>
+                  <div class="toolbar-btn-group">
+                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="link" title="Link wewnętrzny ([[...]])" aria-label="Link wewnętrzny">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                      <span>Link</span>
+                    </button>
+                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="upload-image" title="Wgraj lub wstaw grafikę ([[Plik:...]])" aria-label="Wgraj grafikę">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                      <span>Grafika</span>
+                    </button>
+                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="ref" title="Wstaw przypis (&lt;ref&gt;...&lt;/ref&gt;)" aria-label="Przypis">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                      <span>Przypis</span>
+                    </button>
+                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="bullet" title="Lista punktowana (*)" aria-label="Lista">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+                      <span>Lista</span>
+                    </button>
+                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="table" title="Wstaw tabelę wiki" aria-label="Tabela">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/></svg>
+                      <span>Tabela</span>
+                    </button>
+                  </div>
+                  <div class="toolbar-divider" aria-hidden="true"></div>
+                  <div class="toolbar-btn-group">
+                    <button type="button" class="toolbar-btn btn-tool toolbar-icon-btn btn btn-sm btn-outline" data-action="infobox-helper" title="Rozwiń i edytuj infobox" aria-label="Infobox">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                      <span>Infobox</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="form-group" style="margin-bottom:0;">
+                  <label for="edit-content" class="sr-only">Treść artykułu (wikikod):</label>
+                  <textarea id="edit-content" class="editor-textarea form-control" rows="18" placeholder="Wpisz treść artykułu w wikikodzie..." ${isLockedAndNotAdmin ? 'disabled' : ''}>${escapeHtml(currentArticle.content || '')}</textarea>
+                </div>
+
+                <div class="editor-textarea-footer">
+                  <span class="editor-shortcut-hint">💡 Skróty: <strong>Ctrl+B</strong> pogrubienie, <strong>Ctrl+I</strong> kursywa, <strong>Ctrl+S</strong> zapis</span>
+                  <span class="editor-syntax-guide">Składnia: <code>== Nagłówek ==</code> &middot; <code>[[Link]]</code> &middot; <code>&lt;ref&gt;źródło&lt;/ref&gt;</code></span>
+                </div>
+              </div>
+
+              <!-- Karta 2: Ustawienia Hasła, Zajawka i Kategorie (Collapsible Accordion) -->
+              <details class="editor-card editor-collapsible-card" id="editor-meta-panel" open>
+                <summary class="editor-collapsible-summary">
+                  <span class="summary-left">
+                    <span class="summary-icon">⚙️</span>
+                    <strong class="summary-title">Ustawienia hasła: Zajawka i Kategorie</strong>
+                  </span>
+                  <span class="summary-badge" id="category-count-badge">${catsArr.length} kategorii</span>
+                </summary>
+
+                <div class="editor-collapsible-content">
+                  <div class="form-group">
+                    <label for="edit-summary" class="editor-field-label">Krótkie podsumowanie (zajawka artykułu):</label>
+                    <input type="text" id="edit-summary" class="form-control" value="${escapeHtml(currentArticle.summary || '')}" placeholder="Np. 'Polski astronom i twórca teorii heliocentrycznej.'" ${isLockedAndNotAdmin ? 'disabled' : ''} />
+                    <small class="form-text-muted">Jedno lub dwa zdania streszczające temat hasła, wyświetlane w podglądzie katalogu.</small>
+                  </div>
+
+                  <div class="form-group" style="margin-bottom:0;">
+                    <label for="category-chip-input" class="editor-field-label">Kategorie artykułu:</label>
+                    <div class="category-chips-container">
+                      <div id="category-chips-list" class="category-chips-list"></div>
+                      <div class="category-chip-input-wrap">
+                        <input type="text" id="category-chip-input" class="form-control category-chip-input" placeholder="Wpisz kategorię i naciśnij Enter..." ${isLockedAndNotAdmin ? 'disabled' : ''} />
+                      </div>
+                      <input type="hidden" id="edit-categories" value="${escapeHtml(catString)}" />
+                    </div>
+
+                    <div class="category-suggestions">
+                      <span class="category-suggestions-title">Szybkie dodawanie:</span>
+                      <div class="category-suggestions-list" id="category-suggestions-list">
+                        ${(state.categories && state.categories.length > 0
+                            ? state.categories.map(c => typeof c === 'object' ? c.name : c)
+                            : ['Nauka', 'Historia', 'Polska', 'Technologia', 'Geografia', 'Biografie']
+                          ).slice(0, 8).map(cat => `
+                            <button type="button" class="category-suggestion-pill" data-category="${escapeHtml(cat)}">+ ${escapeHtml(cat)}</button>
+                        `).join('')}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </details>
+
+              <!-- Karta 3: Infobox (Tabela boczna) z szablonami (Collapsible Accordion) -->
+              <details class="editor-card editor-collapsible-card infobox-collapsible-card" id="editor-infobox-panel" ${Object.keys(items).length > 0 ? 'open' : ''}>
+                <summary class="editor-collapsible-summary">
+                  <span class="summary-left">
+                    <span class="summary-icon">ℹ️</span>
+                    <strong class="summary-title">Infobox (tabela boczna artykułu)</strong>
+                  </span>
+                  <span class="summary-badge" id="infobox-count-badge">${Object.keys(items).length > 0 ? `${Object.keys(items).length} pól` : 'Opcjonalny (kliknij aby rozwinąć)'}</span>
+                </summary>
+
+                <div class="editor-collapsible-content">
+                  <fieldset class="infobox-editor-fieldset" ${isLockedAndNotAdmin ? 'disabled' : ''}>
+                    <legend class="sr-only">ℹ️ Infobox (tabela boczna)</legend>
+
+                    <div class="infobox-templates-section">
+                      <div class="infobox-templates-label">
+                        📋 Wstaw gotowy szablon pól (bezpieczne scalanie danych):
+                      </div>
+                      <div class="infobox-templates-grid">
+                        <button type="button" class="btn btn-sm btn-outline infobox-template-btn" data-template="biography">👤 Biografia</button>
+                        <button type="button" class="btn btn-sm btn-outline infobox-template-btn" data-template="geography">🌍 Geografia</button>
+                        <button type="button" class="btn btn-sm btn-outline infobox-template-btn" data-template="science">🔬 Nauka / Pojęcie</button>
+                        <button type="button" class="btn btn-sm btn-outline infobox-template-btn" data-template="organization">🏛️ Organizacja</button>
+                      </div>
+                    </div>
+
+                    <div class="infobox-main-params-grid">
+                      <div class="form-group">
+                        <label for="infobox-title" class="editor-field-label">Tytuł infoboksu:</label>
+                        <input type="text" id="infobox-title" class="form-control" value="${escapeHtml(infoboxObj.title || currentArticle.title || '')}" placeholder="Domyślnie tytuł artykułu" />
+                      </div>
+                      <div class="form-group">
+                        <label for="infobox-image" class="editor-field-label">Adres URL grafiki (opcjonalny):</label>
+                        <input type="url" id="infobox-image" class="form-control" value="${escapeHtml(infoboxObj.image || '')}" placeholder="https://... lub /uploads/..." />
+                      </div>
+                    </div>
+
+                    <div class="infobox-rows-header">
+                      <span class="infobox-rows-label">Własne parametry (Etykieta &rarr; Wartość):</span>
+                      <button type="button" id="infobox-add-row-btn" class="btn btn-sm btn-outline">+ Dodaj kolejne pole</button>
+                    </div>
+
+                    <div id="infobox-rows-container" class="infobox-editor-grid"></div>
+                  </fieldset>
+                </div>
+              </details>
+
+              <!-- Karta 4: Publikacja i Komentarz Rewizji -->
+              <div class="editor-card editor-publish-card">
+                <div class="form-group" style="margin-bottom:12px;">
+                  <label for="edit-comment" class="editor-field-label">Opis zmian (komentarz do wersji):</label>
+                  <input type="text" id="edit-comment" class="form-control" placeholder="Np. 'Utworzenie hasła', 'Korekta literówki', 'Rozszerzenie sekcji'" value="${isNew ? 'Utworzenie artykułu' : ''}" ${isLockedAndNotAdmin ? 'disabled' : ''} />
+                </div>
+
+                <div class="editor-actions">
+                  <button type="submit" id="editor-save-btn" class="btn btn-primary btn-save-main" ${isLockedAndNotAdmin ? 'disabled title="Artykuł zablokowany"' : ''}>
+                    💾 ${isNew ? 'Utwórz artykuł' : 'Zapisz zmiany'}
+                  </button>
+                  <a href="${isNew ? '#/' : `#/wiki/${encodeURIComponent(slug)}`}" class="btn btn-outline">Anuluj</a>
+                </div>
+              </div>
+
+            </form>
           </div>
 
-          <div class="form-group">
-            <label for="edit-summary">Krótkie podsumowanie (zajawka):</label>
-            <input type="text" id="edit-summary" class="form-control" value="${escapeHtml(currentArticle.summary || '')}" placeholder="Jednozdaniowe podsumowanie artykułu" ${isLockedAndNotAdmin ? 'disabled' : ''} />
-          </div>
-
-          <div class="form-group">
-            <label for="edit-categories">Kategorie (oddzielone przecinkami):</label>
-            <input type="text" id="edit-categories" class="form-control" value="${escapeHtml(catString)}" placeholder="Np. Informatyka, Fizyka, Technologia" ${isLockedAndNotAdmin ? 'disabled' : ''} />
-          </div>
-
-          <!-- Pasek narzędzi formatowania -->
-          <div class="editor-toolbar" role="toolbar" aria-label="Narzędzia formatowania">
-            <button type="button" class="toolbar-btn btn-tool" data-action="heading" title="Wstaw nagłówek sekcji (==)"><strong>H2</strong> Nagłówek</button>
-            <button type="button" class="toolbar-btn btn-tool" data-action="subheading" title="Wstaw podnagłówek (===)"><strong>H3</strong> Podnagłówek</button>
-            <button type="button" class="toolbar-btn btn-tool" data-action="bold" title="Pogrubienie ('''tekst''')"><strong>B</strong> Pogrubienie</button>
-            <button type="button" class="toolbar-btn btn-tool" data-action="italic" title="Kursywa (''tekst'')"><em>I</em> Kursywa</button>
-            <button type="button" class="toolbar-btn btn-tool" data-action="link" title="Wstaw link wewnętrzny ([[...]])">🔗 Link [[...]]</button>
-            <button type="button" class="toolbar-btn btn-tool" data-action="ref" title="Wstaw przypis (&lt;ref&gt;...&lt;/ref&gt;)">📑 Przypis</button>
-            <button type="button" class="toolbar-btn btn-tool" data-action="bullet" title="Lista punktowana (*)">• Lista</button>
-            <button type="button" class="toolbar-btn btn-tool" data-action="infobox-helper" title="Dodaj wiersz infoboksu">ℹ️ Pomocnik Infoboksu</button>
-          </div>
-
-          <div class="form-group">
-            <label for="edit-content">Treść artykułu (wikikod): <span class="required">*</span></label>
-            <textarea id="edit-content" class="editor-textarea form-control" rows="18" placeholder="Wpisz treść artykułu w wikikodzie..." ${isLockedAndNotAdmin ? 'disabled' : ''}>${escapeHtml(currentArticle.content || '')}</textarea>
-          </div>
-
-          <!-- Sekcja edytora infoboxu -->
-          <fieldset class="infobox-editor-fieldset" ${isLockedAndNotAdmin ? 'disabled' : ''}>
-            <legend>ℹ️ Infobox (tabela boczna)</legend>
-            <div class="form-group">
-              <label for="infobox-title">Tytuł infoboksu:</label>
-              <input type="text" id="infobox-title" class="form-control" value="${escapeHtml(infoboxObj.title || currentArticle.title || '')}" />
+          <!-- Prawy panel: Podgląd na żywo Split-Screen -->
+          <div class="editor-preview-pane wiki-article-body-wrapper" id="editor-live-preview-pane">
+            <div class="preview-pane-header">
+              <div class="preview-header-left">
+                <strong>👁️ Podgląd na żywo</strong>
+                <span class="preview-live-badge">Live Sync</span>
+              </div>
+              <small id="preview-status">Aktualny</small>
             </div>
-            <div class="form-group">
-              <label for="infobox-image">Adres URL obrazka (opcjonalny):</label>
-              <input type="url" id="infobox-image" class="form-control" value="${escapeHtml(infoboxObj.image || '')}" placeholder="https://..." />
-            </div>
-            <div class="infobox-rows-label">Pola infoboksu (klucz &rarr; wartość):</div>
-            <div id="infobox-rows-container" class="infobox-editor-grid"></div>
-            <button type="button" id="infobox-add-row-btn" class="btn btn-sm btn-outline">+ Dodaj pole infoboxu</button>
-          </fieldset>
-
-          <div class="form-group">
-            <label for="edit-comment">Opis zmian (komentarz do wersji):</label>
-            <input type="text" id="edit-comment" class="form-control" placeholder="Np. 'Utworzenie hasła', 'Korekta literówki', 'Rozszerzenie sekcji'" value="${isNew ? 'Utworzenie artykułu' : ''}" ${isLockedAndNotAdmin ? 'disabled' : ''} />
+            <div id="live-preview-content" class="live-preview-content"></div>
           </div>
-
-          <div class="editor-actions">
-            <button type="button" id="editor-preview-btn" class="btn btn-secondary">👁️ Podgląd na żywo</button>
-            <button type="submit" id="editor-save-btn" class="btn btn-primary" ${isLockedAndNotAdmin ? 'disabled title="Artykuł zablokowany"' : ''}>💾 ${isNew ? 'Utwórz artykuł' : 'Zapisz zmiany'}</button>
-            <a href="${isNew ? '#/' : `#/wiki/${encodeURIComponent(slug)}`}" class="btn btn-outline">Anuluj</a>
-          </div>
-        </form>
-
-        <!-- Pudełko podglądu -->
-        <div id="preview-wrapper" class="preview-wrapper hidden" aria-live="polite">
-          <div class="preview-box-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-            <h2>Podgląd artykułu</h2>
-            <button type="button" id="preview-close-btn" class="btn btn-sm btn-outline">Zamknij podgląd &times;</button>
-          </div>
-          <div id="preview-box" class="preview-box wiki-article-body-wrapper"></div>
         </div>
       </div>
     `;
@@ -857,6 +1334,15 @@
     // Obsługa wierszy infoboxu
     const infoboxContainer = document.getElementById('infobox-rows-container');
     const items = infoboxObj.items || {};
+
+    function updateInfoboxBadge() {
+      const badge = document.getElementById('infobox-count-badge');
+      if (!badge) return;
+      const validRows = Array.from(infoboxContainer.querySelectorAll('.infobox-row-item')).filter(row => {
+        return Boolean(row.querySelector('.info-key')?.value.trim() || row.querySelector('.info-val')?.value.trim());
+      });
+      badge.textContent = validRows.length > 0 ? `${validRows.length} pól` : 'Opcjonalny (kliknij aby rozwinąć)';
+    }
 
     function addInfoboxRow(key = '', val = '') {
       const row = document.createElement('div');
@@ -868,8 +1354,12 @@
       `;
       row.querySelector('.info-del').addEventListener('click', () => {
         row.remove();
+        updateInfoboxBadge();
+        triggerLivePreview();
+        triggerAutoSave();
       });
       infoboxContainer.appendChild(row);
+      updateInfoboxBadge();
     }
 
     const existingEntries = Object.entries(items);
@@ -881,10 +1371,173 @@
 
     document.getElementById('infobox-add-row-btn').addEventListener('click', () => {
       addInfoboxRow('', '');
+      triggerLivePreview();
+      triggerAutoSave();
     });
+
+    // Szablony infoboxu z bezpiecznym scalaniem (safe merge)
+    const infoboxTemplates = {
+      biography: {
+        name: 'Biografia',
+        fields: ['Imię i nazwisko', 'Data urodzenia', 'Miejsce urodzenia', 'Zawód', 'Narodowość']
+      },
+      geography: {
+        name: 'Geografia',
+        fields: ['Państwo', 'Stolica', 'Powierzchnia', 'Liczba ludności', 'Język urzędowy']
+      },
+      science: {
+        name: 'Nauka / Pojęcie',
+        fields: ['Dziedzina', 'Twórca / Odkrywca', 'Rok odkrycia', 'Zastosowanie', 'Status']
+      },
+      organization: {
+        name: 'Organizacja',
+        fields: ['Typ organizacji', 'Siedziba', 'Data założenia', 'Założyciel', 'Liczba członków']
+      }
+    };
+
+    function applyInfoboxTemplate(tplKey) {
+      const tpl = infoboxTemplates[tplKey];
+      if (!tpl) return;
+
+      const infoboxPanel = document.getElementById('editor-infobox-panel');
+      if (infoboxPanel) infoboxPanel.open = true;
+
+      const existingKeys = new Set();
+      infoboxContainer.querySelectorAll('.infobox-row-item').forEach(row => {
+        const k = row.querySelector('.info-key')?.value.trim();
+        if (k) existingKeys.add(k.toLowerCase());
+      });
+
+      let addedCount = 0;
+      tpl.fields.forEach(field => {
+        if (!existingKeys.has(field.toLowerCase())) {
+          const emptyRow = Array.from(infoboxContainer.querySelectorAll('.infobox-row-item')).find(row => {
+            return !row.querySelector('.info-key')?.value.trim() && !row.querySelector('.info-val')?.value.trim();
+          });
+          if (emptyRow) {
+            emptyRow.querySelector('.info-key').value = field;
+          } else {
+            addInfoboxRow(field, '');
+          }
+          existingKeys.add(field.toLowerCase());
+          addedCount++;
+        }
+      });
+
+      updateInfoboxBadge();
+
+      if (addedCount > 0) {
+        showToast(`Dodano ${addedCount} nowych pól z szablonu "${tpl.name}".`, 'info');
+        triggerLivePreview();
+        triggerAutoSave();
+      } else {
+        showToast(`Wszystkie pola z szablonu "${tpl.name}" już znajdują się w infoboxie.`, 'info');
+      }
+    }
+
+    document.querySelectorAll('.infobox-template-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        applyInfoboxTemplate(btn.dataset.template);
+      });
+    });
+
+    // Obsługa chipów kategorii
+    let currentCategories = parseCategories(currentArticle.categories);
+
+    function renderCategoryChips() {
+      const listEl = document.getElementById('category-chips-list');
+      if (!listEl) return;
+      listEl.innerHTML = currentCategories.map((cat, idx) => `
+        <span class="category-chip" data-category="${escapeHtml(cat)}">
+          ${escapeHtml(cat)}
+          <button type="button" class="category-chip-remove" data-index="${idx}" title="Usuń kategorię ${escapeHtml(cat)}" aria-label="Usuń kategorię ${escapeHtml(cat)}">&times;</button>
+        </span>
+      `).join('');
+
+      const hiddenInput = document.getElementById('edit-categories');
+      if (hiddenInput) {
+        hiddenInput.value = currentCategories.join(', ');
+      }
+
+      const catCountBadge = document.getElementById('category-count-badge');
+      if (catCountBadge) {
+        catCountBadge.textContent = `${currentCategories.length} kategorii`;
+      }
+
+      document.querySelectorAll('.category-suggestion-pill').forEach(pill => {
+        const catName = pill.dataset.category;
+        if (currentCategories.some(c => c.toLowerCase() === catName.toLowerCase())) {
+          pill.classList.add('selected');
+        } else {
+          pill.classList.remove('selected');
+        }
+      });
+
+      listEl.querySelectorAll('.category-chip-remove').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const idx = Number(btn.dataset.index);
+          removeCategory(idx);
+        });
+      });
+    }
+
+    function addCategory(name) {
+      const clean = name.trim().replace(/^,+|,+$/g, '');
+      if (!clean) return;
+      if (!currentCategories.some(c => c.toLowerCase() === clean.toLowerCase())) {
+        currentCategories.push(clean);
+        renderCategoryChips();
+        triggerLivePreview();
+        triggerAutoSave();
+      }
+    }
+
+    function removeCategory(index) {
+      if (index >= 0 && index < currentCategories.length) {
+        currentCategories.splice(index, 1);
+        renderCategoryChips();
+        triggerLivePreview();
+        triggerAutoSave();
+      }
+    }
+
+    const catInput = document.getElementById('category-chip-input');
+    if (catInput) {
+      catInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ',') {
+          e.preventDefault();
+          const val = catInput.value;
+          if (val) {
+            val.split(',').forEach(part => addCategory(part));
+            catInput.value = '';
+          }
+        }
+      });
+      catInput.addEventListener('blur', () => {
+        const val = catInput.value;
+        if (val) {
+          val.split(',').forEach(part => addCategory(part));
+          catInput.value = '';
+        }
+      });
+    }
+
+    document.querySelectorAll('.category-suggestion-pill').forEach(pill => {
+      pill.addEventListener('click', (e) => {
+        e.preventDefault();
+        const cat = pill.dataset.category;
+        if (cat) addCategory(cat);
+      });
+    });
+
+    renderCategoryChips();
 
     // Pasek narzędzi
     const textarea = document.getElementById('edit-content');
+    const fileUploadInput = document.getElementById('editor-file-upload');
+
     function insertAroundSelection(before, after = '') {
       const start = textarea.selectionStart;
       const end = textarea.selectionEnd;
@@ -894,47 +1547,38 @@
       textarea.focus();
       textarea.selectionStart = start + before.length;
       textarea.selectionEnd = textarea.selectionStart + (selText.length || 5);
+      triggerLivePreview();
+      triggerAutoSave();
+      updateEditorMetrics();
     }
 
-    document.querySelectorAll('.editor-toolbar .toolbar-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const action = btn.dataset.action;
-        if (action === 'heading') insertAroundSelection('\n== ', ' ==\n');
-        if (action === 'subheading') insertAroundSelection('\n=== ', ' ===\n');
-        if (action === 'bold') insertAroundSelection("'''", "'''");
-        if (action === 'italic') insertAroundSelection("''", "''");
-        if (action === 'link') insertAroundSelection('[[', ']]');
-        if (action === 'ref') insertAroundSelection('<ref>', '</ref>');
-        if (action === 'bullet') insertAroundSelection('\n* ');
-        if (action === 'infobox-helper') {
-          addInfoboxRow('Klucz', 'Wartość');
-          showToast('Dodano pole do infoboksu poniżej', 'info');
-        }
-      });
-    });
+    // Liczniki słów, znaków i czasu czytania
+    function updateEditorMetrics() {
+      const content = textarea ? textarea.value : '';
+      const chars = content.length;
+      const words = content.trim() ? content.trim().split(/\s+/).length : 0;
+      const readingMinutes = words > 0 ? Math.ceil(words / 200) : 0;
 
-    // Skróty klawiszowe w edytorze (Ctrl+S, Ctrl+B, Ctrl+I)
-    const editorForm = document.getElementById('article-editor-form');
-    textarea.addEventListener('keydown', (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
-        e.preventDefault();
-        insertAroundSelection("'''", "'''");
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'i') {
-        e.preventDefault();
-        insertAroundSelection("''", "''");
-      }
-    });
+      const wordBadge = document.getElementById('editor-word-count');
+      const charBadge = document.getElementById('editor-char-count');
+      const readBadge = document.getElementById('editor-reading-time');
 
-    editorForm.addEventListener('keydown', (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-        e.preventDefault();
-        if (!isLockedAndNotAdmin) {
-          editorForm.requestSubmit();
-        }
-      }
-    });
+      if (wordBadge) wordBadge.textContent = `${words} słów`;
+      if (charBadge) charBadge.textContent = `${chars} znaków`;
+      if (readBadge) readBadge.textContent = `~${readingMinutes} min czytania`;
+    }
 
-    // Zbieranie danych infoboxu z formularza
+    // Podgląd wygenerowanego sluga w czasie rzeczywistym
+    function updateSlugPreview() {
+      const titleInput = document.getElementById('edit-title');
+      const previewEl = document.getElementById('editor-slug-preview');
+      if (!previewEl) return;
+      const val = titleInput ? titleInput.value.trim() : '';
+      const s = slugify(val);
+      previewEl.textContent = s ? `#/wiki/${s}` : '#/wiki/...';
+    }
+
+    // Zbieranie danych infoboxu
     function collectInfoboxData() {
       const title = document.getElementById('infobox-title').value.trim();
       const image = sanitizeImageUrl(document.getElementById('infobox-image').value.trim());
@@ -956,34 +1600,284 @@
       };
     }
 
-    // Podgląd na żywo
-    document.getElementById('editor-preview-btn').addEventListener('click', async () => {
-      const content = textarea.value;
-      const title = document.getElementById('edit-title').value.trim() || 'Podgląd';
-      const previewWrapper = document.getElementById('preview-wrapper');
-      const previewBox = document.getElementById('preview-box');
+    // Podgląd na żywo z debouncingiem (150ms)
+    let livePreviewTimer = null;
+    let livePreviewReqId = 0;
 
-      try {
-        const res = await api('/api/preview', {
-          method: 'POST',
-          body: { content, title }
-        });
-        const currentInfobox = collectInfoboxData();
-        previewBox.innerHTML = `
-          ${renderInfobox(currentInfobox, title)}
-          ${renderToc(res.toc)}
-          <div class="wiki-article-body">${res.renderedHtml || '<p><em>Pusta treść</em></p>'}</div>
-        `;
-        previewWrapper.classList.remove('hidden');
-        previewWrapper.scrollIntoView({ behavior: 'smooth' });
-      } catch (err) {
-        showToast('Błąd podglądu: ' + err.message, 'error');
+    function triggerLivePreview() {
+      if (livePreviewTimer) clearTimeout(livePreviewTimer);
+      const previewStatus = document.getElementById('preview-status');
+      if (previewStatus) previewStatus.textContent = 'Renderowanie...';
+
+      const currentReq = ++livePreviewReqId;
+      livePreviewTimer = setTimeout(async () => {
+        const content = textarea.value;
+        const title = document.getElementById('edit-title').value.trim() || 'Podgląd';
+        const previewContent = document.getElementById('live-preview-content');
+        if (!previewContent) return;
+
+        try {
+          const res = await api('/api/preview', {
+            method: 'POST',
+            body: { content, title }
+          });
+          if (currentReq !== livePreviewReqId) return;
+
+          const currentInfobox = collectInfoboxData();
+          previewContent.innerHTML = `
+            ${renderInfobox(currentInfobox, title)}
+            ${renderToc(res.toc)}
+            <div class="wiki-article-body">${res.renderedHtml || '<p><em>Pusta treść</em></p>'}</div>
+          `;
+          if (previewStatus) previewStatus.textContent = 'Zaktualizowano';
+        } catch {
+          if (currentReq === livePreviewReqId && previewStatus) {
+            previewStatus.textContent = 'Błąd podglądu';
+          }
+        }
+      }, 150);
+    }
+
+    // Automatyczny zapis kopii roboczej (Auto-save) w ustrukturyzowanej postaci
+    let autoSaveTimer = null;
+    function triggerAutoSave() {
+      const indicator = document.getElementById('editor-autosave-indicator');
+      if (indicator) indicator.textContent = '💾 Zapisywanie szkicu...';
+      if (autoSaveTimer) clearTimeout(autoSaveTimer);
+      autoSaveTimer = setTimeout(() => {
+        const draftData = {
+          title: document.getElementById('edit-title')?.value || '',
+          summary: document.getElementById('edit-summary')?.value || '',
+          content: textarea?.value || '',
+          infobox: collectInfoboxData(),
+          categories: document.getElementById('edit-categories')?.value || '',
+          savedAt: Date.now()
+        };
+        safeSetStorage(draftStorageKey, JSON.stringify(draftData));
+        if (indicator) indicator.textContent = '✓ Zapisano w szkicu';
+      }, 1500);
+    }
+
+    // Obsługa akcji w przypadku wykrytego konfliktu wersji
+    if (hasDraftConflict) {
+      document.getElementById('draft-use-local-btn')?.addEventListener('click', () => {
+        if (savedDraft.title && document.getElementById('edit-title')) {
+          document.getElementById('edit-title').value = savedDraft.title;
+        }
+        if (savedDraft.summary && document.getElementById('edit-summary')) {
+          document.getElementById('edit-summary').value = savedDraft.summary;
+        }
+        if (savedDraft.content && textarea) {
+          textarea.value = savedDraft.content;
+        }
+        if (savedDraft.categories && document.getElementById('edit-categories')) {
+          document.getElementById('edit-categories').value = savedDraft.categories;
+          currentCategories = parseCategories(savedDraft.categories);
+          renderCategoryChips();
+        }
+        document.getElementById('draft-conflict-banner')?.remove();
+        showToast('Zastosowano lokalny szkic.', 'info');
+        triggerLivePreview();
+        updateEditorMetrics();
+        updateSlugPreview();
+      });
+
+      document.getElementById('draft-use-server-btn')?.addEventListener('click', () => {
+        safeRemoveStorage(draftStorageKey);
+        document.getElementById('draft-conflict-banner')?.remove();
+        showToast('Zachowano wersję z serwera, szkic usunięty.', 'info');
+      });
+    } else if (isDraftNewer) {
+      document.getElementById('draft-restore-btn')?.addEventListener('click', () => {
+        if (savedDraft.title && document.getElementById('edit-title')) {
+          document.getElementById('edit-title').value = savedDraft.title;
+        }
+        if (savedDraft.summary && document.getElementById('edit-summary')) {
+          document.getElementById('edit-summary').value = savedDraft.summary;
+        }
+        if (savedDraft.content && textarea) {
+          textarea.value = savedDraft.content;
+        }
+        if (savedDraft.categories && document.getElementById('edit-categories')) {
+          document.getElementById('edit-categories').value = savedDraft.categories;
+          currentCategories = parseCategories(savedDraft.categories);
+          renderCategoryChips();
+        }
+        document.getElementById('draft-restore-banner')?.remove();
+        showToast('Kopia robocza została przywrócona!', 'info');
+        triggerLivePreview();
+        updateEditorMetrics();
+        updateSlugPreview();
+      });
+
+      document.getElementById('draft-dismiss-btn')?.addEventListener('click', () => {
+        safeRemoveStorage(draftStorageKey);
+        document.getElementById('draft-restore-banner')?.remove();
+      });
+    }
+
+    // Wgrywanie grafiki na serwer przez przycisk narzędziowy
+    if (fileUploadInput) {
+      fileUploadInput.onchange = async () => {
+        const file = fileUploadInput.files && fileUploadInput.files[0];
+        if (!file) return;
+
+        if (file.size > 5 * 1024 * 1024) {
+          showToast('Rozmiar pliku przekracza dopuszczalny limit 5MB', 'warning');
+          fileUploadInput.value = '';
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append('file', file);
+
+        showToast(`Wgrywanie pliku: ${file.name}...`, 'info');
+        try {
+          const res = await api('/api/upload', {
+            method: 'POST',
+            body: formData
+          });
+          const uploadedName = res.filename || (res.file && res.file.filename) || file.name;
+          insertAroundSelection(`[[Plik:${uploadedName}|miniaturka|prawo|Opis grafiki]]\n`, '');
+          showToast(`Grafika ${uploadedName} została wgrana!`, 'success');
+        } catch (err) {
+          showToast(`Błąd wgrywania: ${err.message}`, 'error');
+        } finally {
+          fileUploadInput.value = '';
+        }
+      };
+    }
+
+    // Obsługa przycisków paska narzędzi
+    document.querySelectorAll('.editor-toolbar .toolbar-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const action = btn.dataset.action;
+        if (action === 'heading') insertAroundSelection('\n== ', ' ==\n');
+        if (action === 'subheading') insertAroundSelection('\n=== ', ' ===\n');
+        if (action === 'bold') insertAroundSelection("'''", "'''");
+        if (action === 'italic') insertAroundSelection("''", "''");
+        if (action === 'link') insertAroundSelection('[[', ']]');
+        if (action === 'ref') insertAroundSelection('<ref>', '</ref>');
+        if (action === 'bullet') insertAroundSelection('\n* ');
+        if (action === 'table') {
+          insertAroundSelection(
+            '\n{| class="wiki-table"\n! Nagłówek 1 !! Nagłówek 2\n|-\n| Dane 1 || Dane 2\n|-\n| Dane 3 || Dane 4\n|}\n',
+            ''
+          );
+        }
+        if (action === 'code') {
+          insertAroundSelection('`', '`');
+        }
+        if (action === 'upload-image') {
+          fileUploadInput?.click();
+        }
+        if (action === 'infobox-helper') {
+          const infoboxPanel = document.getElementById('editor-infobox-panel');
+          if (infoboxPanel) {
+            infoboxPanel.open = true;
+            infoboxPanel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            document.getElementById('infobox-title')?.focus();
+          } else {
+            const infoboxFieldset = document.querySelector('.infobox-editor-fieldset');
+            if (infoboxFieldset) {
+              infoboxFieldset.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              document.getElementById('infobox-title')?.focus();
+            } else {
+              addInfoboxRow('Klucz', 'Wartość');
+              triggerLivePreview();
+            }
+          }
+          showToast('Rozwinięto sekcję infoboksu', 'info');
+        }
+      });
+    });
+
+    // Przycisk Trybu Zen w nagłówku edytora
+    document.getElementById('zen-toggle-btn')?.addEventListener('click', () => {
+      toggleZenMode();
+    });
+
+    // Szybki przycisk zapisu w nagłówku edytora
+    document.getElementById('editor-top-save-btn')?.addEventListener('click', () => {
+      if (!isLockedAndNotAdmin) {
+        editorForm.requestSubmit();
       }
     });
 
-    document.getElementById('preview-close-btn')?.addEventListener('click', () => {
-      document.getElementById('preview-wrapper')?.classList.add('hidden');
+    // Przełączanie trybów edytora (split / editor / preview)
+    const leftPane = document.getElementById('editor-left-pane');
+    const previewPane = document.getElementById('editor-live-preview-pane');
+
+    document.querySelectorAll('.editor-mode-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.editor-mode-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        const mode = btn.dataset.mode;
+
+        if (mode === 'split') {
+          leftPane.style.display = 'block';
+          previewPane.style.display = 'block';
+        } else if (mode === 'editor') {
+          leftPane.style.display = 'block';
+          previewPane.style.display = 'none';
+        } else if (mode === 'preview') {
+          leftPane.style.display = 'none';
+          previewPane.style.display = 'block';
+          triggerLivePreview();
+        }
+      });
     });
+
+    // Nasłuch zmian w edytorze dla live preview, auto-save i metryk
+    textarea.addEventListener('input', () => {
+      updateEditorMetrics();
+      triggerLivePreview();
+      triggerAutoSave();
+    });
+    document.getElementById('edit-title')?.addEventListener('input', () => {
+      updateSlugPreview();
+      triggerLivePreview();
+      triggerAutoSave();
+    });
+    document.getElementById('infobox-title')?.addEventListener('input', () => {
+      triggerLivePreview();
+      triggerAutoSave();
+    });
+    document.getElementById('infobox-image')?.addEventListener('input', () => {
+      triggerLivePreview();
+      triggerAutoSave();
+    });
+
+    // Skróty klawiszowe w edytorze (Ctrl+S, Ctrl+B, Ctrl+I, F11)
+    const editorForm = document.getElementById('article-editor-form');
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'F11') {
+        e.preventDefault();
+        toggleZenMode();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        insertAroundSelection("'''", "'''");
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'i') {
+        e.preventDefault();
+        insertAroundSelection("''", "''");
+      }
+    });
+
+    editorForm.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        if (!isLockedAndNotAdmin) {
+          editorForm.requestSubmit();
+        }
+      }
+    });
+
+    // Inicjalizacja metryk i sluga
+    updateEditorMetrics();
+    updateSlugPreview();
+
+    // Inicjalne renderowanie podglądu na żywo
+    triggerLivePreview();
 
     // Zapis formularza
     editorForm.addEventListener('submit', async (e) => {
@@ -1017,8 +1911,15 @@
 
       const infobox = collectInfoboxData();
       const saveBtn = document.getElementById('editor-save-btn');
-      saveBtn.disabled = true;
-      saveBtn.textContent = 'Zapisywanie...';
+      const topSaveBtn = document.getElementById('editor-top-save-btn');
+      if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.textContent = 'Zapisywanie...';
+      }
+      if (topSaveBtn) {
+        topSaveBtn.disabled = true;
+        topSaveBtn.textContent = 'Zapisywanie...';
+      }
 
       try {
         if (isNew) {
@@ -1026,6 +1927,7 @@
             method: 'POST',
             body: { title, summary, content, infobox, categories, edit_comment: edit_comment || 'Utworzenie artykułu' }
           });
+          safeRemoveStorage(draftStorageKey);
           showToast('Artykuł został pomyślnie utworzony!', 'success');
           window.location.hash = `#/wiki/${encodeURIComponent(res.article.slug)}`;
         } else {
@@ -1033,13 +1935,20 @@
             method: 'PUT',
             body: { title, summary, content, infobox, categories, edit_comment: edit_comment || 'Edycja artykułu' }
           });
+          safeRemoveStorage(draftStorageKey);
           showToast('Zmiany w artykule zostały zapisane!', 'success');
           window.location.hash = `#/wiki/${encodeURIComponent(res.article.slug)}`;
         }
       } catch (err) {
         showToast(err.message, 'error');
-        saveBtn.disabled = false;
-        saveBtn.textContent = isNew ? '💾 Utwórz artykuł' : '💾 Zapisz zmiany';
+        if (saveBtn) {
+          saveBtn.disabled = false;
+          saveBtn.textContent = isNew ? '💾 Utwórz artykuł' : '💾 Zapisz zmiany';
+        }
+        if (topSaveBtn) {
+          topSaveBtn.disabled = false;
+          topSaveBtn.textContent = isNew ? '💾 Utwórz artykuł' : '💾 Zapisz';
+        }
       }
     });
   }
@@ -1058,6 +1967,53 @@
       setPageTitle(`Dyskusja: ${artData.article.title}`);
       updateArticleTabs(slug, 'talk', artData.revisionsCount, messages.length);
 
+      function renderTalkQuoteContent(rawText) {
+        if (!rawText) return '';
+        const lines = rawText.split('\n');
+        const output = [];
+        let quoteBuffer = [];
+
+        for (const line of lines) {
+          if (line.startsWith('>')) {
+            quoteBuffer.push(line.replace(/^>\s?/, ''));
+          } else {
+            if (quoteBuffer.length > 0) {
+              output.push(`<blockquote class="talk-quote-block">${escapeHtml(quoteBuffer.join('\n'))}</blockquote>`);
+              quoteBuffer = [];
+            }
+            if (line.trim() !== '') {
+              output.push(escapeHtml(line));
+            }
+          }
+        }
+        if (quoteBuffer.length > 0) {
+          output.push(`<blockquote class="talk-quote-block">${escapeHtml(quoteBuffer.join('\n'))}</blockquote>`);
+        }
+        return output.join('<br />').replace(/(<\/blockquote>)<br \/>/g, '$1');
+      }
+
+      function getAuthorRoleInfo(author, msgRole) {
+        const role = (msgRole || '').toLowerCase();
+        if (role === 'admin') return { label: 'Administrator', cssClass: 'role-admin' };
+        if (role === 'editor') return { label: 'Redaktor', cssClass: 'role-editor' };
+        if (role === 'user') return { label: 'Użytkownik', cssClass: 'role-user' };
+        if (role === 'blocked') return { label: 'Zablokowany', cssClass: 'role-blocked' };
+        if (role === 'anon') return { label: 'Anonim', cssClass: 'role-anon' };
+
+        const lowerAuthor = (author || '').trim().toLowerCase();
+        if (lowerAuthor === 'admin') return { label: 'Administrator', cssClass: 'role-admin' };
+        if (lowerAuthor === 'redaktor') return { label: 'Redaktor', cssClass: 'role-editor' };
+        if (state.currentUser && state.currentUser.username.toLowerCase() === lowerAuthor) {
+          if (state.currentUser.role === 'admin') return { label: 'Administrator', cssClass: 'role-admin' };
+          if (state.currentUser.role === 'editor') return { label: 'Redaktor', cssClass: 'role-editor' };
+          if (state.currentUser.role === 'user') return { label: 'Użytkownik', cssClass: 'role-user' };
+        }
+        if (!lowerAuthor || lowerAuthor === 'anonim' || lowerAuthor === 'anonymous') {
+          return { label: 'Anonim', cssClass: 'role-anon' };
+        }
+        return { label: 'Użytkownik', cssClass: 'role-user' };
+      }
+
       viewRoot.innerHTML = `
         <div class="talk-thread">
           <header class="talk-header">
@@ -1070,15 +2026,24 @@
               <div class="talk-empty">
                 <p>Brak wpisów w dyskusji nad tym hasłem. Bądź pierwszą osobą, która zabierze głos!</p>
               </div>
-            ` : messages.map(msg => `
-              <div class="talk-message-card" id="talk-msg-${msg.id}">
-                <div class="talk-message-header talk-msg-header">
-                  <span class="talk-message-author talk-author">💬 <strong>${escapeHtml(msg.author || 'Anonim')}</strong></span>
-                  <span class="talk-message-date talk-date">${formatDate(msg.created_at)}</span>
+            ` : messages.map(msg => {
+              const roleInfo = getAuthorRoleInfo(msg.author, msg.author_role);
+              return `
+                <div class="talk-message-card" id="talk-msg-${msg.id}">
+                  <div class="talk-message-header talk-msg-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                    <div class="talk-author-info" style="display:flex; align-items:center;">
+                      <span class="talk-message-author talk-author">💬 <strong>${escapeHtml(msg.author || 'Anonim')}</strong></span>
+                      <span class="talk-role-badge ${roleInfo.cssClass}">${escapeHtml(roleInfo.label)}</span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                      <span class="talk-message-date talk-date">${formatDate(msg.created_at)}</span>
+                      <button type="button" class="btn btn-sm btn-outline-secondary btn-quote-reply" data-author="${escapeHtml(msg.author || 'Anonim')}" data-content="${escapeHtml(msg.content)}" title="Odpowiedz z cytatem" aria-label="Odpowiedz z cytatem">💬 Cytuj</button>
+                    </div>
+                  </div>
+                  <div class="talk-message-content talk-msg-content">${renderTalkQuoteContent(msg.content)}</div>
                 </div>
-                <div class="talk-message-content talk-msg-content">${escapeHtml(msg.content)}</div>
-              </div>
-            `).join('')}
+              `;
+            }).join('')}
           </div>
 
           <!-- Formularz dodania wypowiedzi -->
@@ -1091,6 +2056,13 @@
               </div>
               <div class="form-group">
                 <label for="talk-content-input">Treść wiadomości: <span class="required">*</span></label>
+                <!-- Mini toolbar formatowania dyskusji -->
+                <div class="talk-mini-toolbar" role="toolbar" aria-label="Formatowanie tekstu dyskusji">
+                  <button type="button" class="btn btn-sm btn-outline btn-talk-tool" data-action="bold" title="Pogrubienie ('''tekst''')"><strong>B</strong></button>
+                  <button type="button" class="btn btn-sm btn-outline btn-talk-tool" data-action="italic" title="Kursywa (''tekst'')"><em>I</em></button>
+                  <button type="button" class="btn btn-sm btn-outline btn-talk-tool" data-action="link" title="Link wewnętrzny ([[...]])">🔗 Link</button>
+                  <button type="button" class="btn btn-sm btn-outline btn-talk-tool" data-action="quote" title="Cytat (&gt;)">❝ Cytat</button>
+                </div>
                 <textarea id="talk-content-input" class="form-control" rows="4" placeholder="Wpisz treść swojej uwagi lub propozycji do artykułu..." required></textarea>
               </div>
               <button type="submit" id="talk-submit-btn" class="btn btn-primary">Wyślij wypowiedź</button>
@@ -1098,6 +2070,49 @@
           </div>
         </div>
       `;
+
+      // Obsługa przycisków "Odpowiedz z cytatem" (.btn-quote-reply)
+      document.querySelectorAll('.btn-quote-reply').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const author = btn.dataset.author || 'Anonim';
+          const content = btn.dataset.content || '';
+          const quoteLines = content.trim().split('\n').map(l => `> ${l}`).join('\n');
+          const quoteBlock = `> [${author}]:\n${quoteLines}\n\n`;
+
+          const textarea = document.getElementById('talk-content-input');
+          if (textarea) {
+            textarea.value = textarea.value ? `${textarea.value.trim()}\n\n${quoteBlock}` : quoteBlock;
+            textarea.focus();
+            textarea.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+          }
+        });
+      });
+
+      // Obsługa mini-toolbara w formularzu dyskusji
+      const talkTextarea = document.getElementById('talk-content-input');
+      document.querySelectorAll('.talk-mini-toolbar .btn-talk-tool').forEach(toolBtn => {
+        toolBtn.addEventListener('click', () => {
+          if (!talkTextarea) return;
+          const action = toolBtn.dataset.action;
+          const start = talkTextarea.selectionStart;
+          const end = talkTextarea.selectionEnd;
+          const sel = talkTextarea.value.substring(start, end);
+
+          let before = '';
+          let after = '';
+          if (action === 'bold') { before = "'''"; after = "'''"; }
+          else if (action === 'italic') { before = "''"; after = "''"; }
+          else if (action === 'link') { before = "[["; after = "]]"; }
+          else if (action === 'quote') { before = "\n> "; after = "\n"; }
+
+          const replacement = before + (sel || (action === 'quote' ? 'Treść cytatu' : 'tekst')) + after;
+          talkTextarea.value = talkTextarea.value.substring(0, start) + replacement + talkTextarea.value.substring(end);
+          talkTextarea.focus();
+          const newCursor = start + before.length + (sel ? sel.length : (action === 'quote' ? 12 : 5));
+          talkTextarea.setSelectionRange(newCursor, newCursor);
+        });
+      });
 
       const talkForm = document.getElementById('talk-add-form');
       talkForm.addEventListener('submit', async (e) => {
@@ -1317,7 +2332,7 @@
     });
   }
 
-  // --- WIDOK 7: Katalog Artykułów (#/articles) ---
+  // --- WIDOK 7: Katalog Artykułów (#/articles) z obsługą FTS ---
   async function renderArticlesCatalog(query = '', selectedCategory = '') {
     updateArticleTabs(null);
     setPageTitle('Indeks artykułów');
@@ -1326,10 +2341,22 @@
     viewRoot.innerHTML = '<div class="wiki-loading">Ładowanie katalogu artykułów...</div>';
 
     try {
-      const qParam = query ? `&q=${encodeURIComponent(query)}` : '';
-      const catParam = selectedCategory ? `&category=${encodeURIComponent(selectedCategory)}` : '';
-      const data = await api(`/api/articles?includeUnpublished=1${qParam}${catParam}`);
-      const articles = data.articles || [];
+      let articles = [];
+      if (query && !selectedCategory) {
+        // Używamy zaawansowanego endpointu FTS5
+        const searchData = await api(`/api/search?q=${encodeURIComponent(query)}`).catch(() => null);
+        if (searchData && (searchData.articles || searchData.results)) {
+          articles = searchData.articles || searchData.results;
+        } else {
+          const fallbackData = await api(`/api/articles?includeUnpublished=1&q=${encodeURIComponent(query)}`);
+          articles = fallbackData.articles || [];
+        }
+      } else {
+        const qParam = query ? `&q=${encodeURIComponent(query)}` : '';
+        const catParam = selectedCategory ? `&category=${encodeURIComponent(selectedCategory)}` : '';
+        const data = await api(`/api/articles?includeUnpublished=1${qParam}${catParam}`);
+        articles = data.articles || [];
+      }
 
       viewRoot.innerHTML = `
         <div class="articles-catalog-page">
@@ -1337,7 +2364,7 @@
             <div class="catalog-header-row">
               <div>
                 <h1>Indeks artykułów</h1>
-                <p>Spis haseł encyklopedycznych z filtrowaniem według nazwy i działu.</p>
+                <p>Spis haseł encyklopedycznych z pełnotekstowym wyszukiwaniem i filtrowaniem działów.</p>
               </div>
               ${canEditWiki() ? '<a href="#/new" class="catalog-create-link btn btn-primary btn-sm">+ Utwórz nowe hasło</a>' : ''}
             </div>
@@ -1377,6 +2404,10 @@
               </div>
             ` : articles.map(art => {
               const cats = parseCategories(art.categories);
+              const summaryHtml = art.snippet
+                ? renderSearchSnippet(art.snippet)
+                : escapeHtml(art.summary || 'Brak podsumowania.');
+
               return `
                 <article class="catalog-article-card">
                   <div class="catalog-card-main">
@@ -1388,7 +2419,7 @@
                         ${!art.is_published ? '<span class="catalog-tag catalog-tag-draft">Szkic</span>' : ''}
                       </div>
                     </div>
-                    <p class="catalog-card-summary">${escapeHtml(art.summary || 'Brak podsumowania.')}</p>
+                    <p class="catalog-card-summary">${summaryHtml}</p>
                     <div class="catalog-card-footer">
                       ${cats && cats.length > 0 ? `
                         <div class="catalog-card-cats">
@@ -2137,6 +3168,9 @@
     if (pathPart === '#/articles') {
       return { name: 'articles', params: {}, query };
     }
+    if (pathPart === '#/watchlist') {
+      return { name: 'watchlist', params: {}, query };
+    }
     if (pathPart === '#/recent-changes') {
       return { name: 'recent-changes', params: {}, query };
     }
@@ -2183,6 +3217,11 @@
     state.currentRoute = route;
     updateHeaderAndSidebar();
 
+    // Sprzątanie trybu Zen przy opuszczeniu edytora
+    if (route.name !== 'wiki-edit' && route.name !== 'new') {
+      document.body.classList.remove('editor-zen-active');
+    }
+
     // Zamknięcie podpowiedzi wyszukiwania przy zmianie trasy
     const suggestions = document.getElementById('search-suggestions');
     if (suggestions) suggestions.classList.add('hidden');
@@ -2225,6 +3264,9 @@
         renderArticlesCatalog(q, cat);
         break;
       }
+      case 'watchlist':
+        renderWatchlistView();
+        break;
       case 'categories':
         renderCategoriesView(null);
         break;
@@ -2409,7 +3451,7 @@
     }
   }
 
-  // --- Dynamiczna wyszukiwarka i losowanie artykułu ---
+  // --- Dynamiczna wyszukiwarka z obsługą FTS5 i losowanie artykułu ---
   function initSearchAndRandom() {
     const searchForm = document.getElementById('search-form');
     const searchInput = document.getElementById('search-input');
@@ -2482,7 +3524,7 @@
       });
     }
 
-    // Dynamiczne podpowiedzi w wyszukiwarce (debounced)
+    // Dynamiczne podpowiedzi w wyszukiwarce (debounced z FTS5)
     if (searchInput && suggestionsEl) {
       searchInput.addEventListener('input', () => {
         if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
@@ -2500,10 +3542,14 @@
 
         searchDebounceTimer = setTimeout(async () => {
           try {
-            const data = await api(`/api/articles?q=${encodeURIComponent(query)}`);
+            // Najpierw próbujemy zaawansowany endpoint FTS5 /api/search
+            let data = await api(`/api/search?q=${encodeURIComponent(query)}`).catch(() => null);
+            if (!data || (!data.articles && !data.results)) {
+              data = await api(`/api/articles?q=${encodeURIComponent(query)}`);
+            }
             if (currentReq !== searchRequestId) return;
 
-            const results = (data.articles || []).slice(0, 5);
+            const results = (data.articles || data.results || []).slice(0, 5);
 
             if (results.length === 0) {
               suggestionsEl.innerHTML = `
@@ -2518,12 +3564,17 @@
               `;
             } else {
               suggestionsEl.innerHTML = `
-                ${results.map(art => `
-                  <a href="#/wiki/${encodeURIComponent(art.slug)}" class="search-suggestion-item" role="option">
-                    <div class="search-suggestion-title">${escapeHtml(art.title)}</div>
-                    ${art.summary ? `<div class="search-suggestion-snippet">${escapeHtml(art.summary)}</div>` : ''}
-                  </a>
-                `).join('')}
+                ${results.map(art => {
+                  const snippetHtml = art.snippet
+                    ? renderSearchSnippet(art.snippet)
+                    : escapeHtml(art.summary || '');
+                  return `
+                    <a href="#/wiki/${encodeURIComponent(art.slug)}" class="search-suggestion-item" role="option">
+                      <div class="search-suggestion-title">${escapeHtml(art.title)}</div>
+                      ${snippetHtml ? `<div class="search-suggestion-snippet">${snippetHtml}</div>` : ''}
+                    </a>
+                  `;
+                }).join('')}
                 ${canEditWiki() ? `
                   <a href="#/new?title=${encodeURIComponent(query)}" class="search-suggestion-item search-suggestion-create" role="option">
                     ➕ Utwórz brakujący artykuł: <strong>${escapeHtml(query)}</strong>
@@ -2694,6 +3745,27 @@
 
     updateHeaderAndSidebar();
 
+    // Obsługa pływającego przycisku wyjścia z trybu Zen
+    const zenExitBtn = document.getElementById('zen-exit-floating-btn');
+    if (zenExitBtn) {
+      zenExitBtn.addEventListener('click', () => {
+        toggleZenMode(false);
+      });
+    }
+
+    // Skróty klawiszowe dla trybu Zen (Alt+Z oraz Escape)
+    document.addEventListener('keydown', (e) => {
+      if (e.altKey && (e.key === 'z' || e.key === 'Z')) {
+        if (state.currentRoute && (state.currentRoute.name === 'wiki-edit' || state.currentRoute.name === 'new')) {
+          e.preventDefault();
+          toggleZenMode();
+        }
+      }
+      if (e.key === 'Escape' && document.body.classList.contains('editor-zen-active')) {
+        toggleZenMode(false);
+      }
+    });
+
     // Nasłuchiwanie zmian hasha w adresie
     window.addEventListener('hashchange', handleRoute);
 
@@ -2716,7 +3788,10 @@
     clearAuthToken,
     parseCategories,
     getCatName,
-    getCatCount
+    getCatCount,
+    renderWatchlistView,
+    slugify,
+    toggleZenMode
   };
 
   // Uruchomienie po załadowaniu DOM

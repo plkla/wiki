@@ -162,11 +162,90 @@ function createWikiDb(dbPathOrOptions) {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS media (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      filename TEXT UNIQUE NOT NULL,
+      original_name TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      uploader TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS watchlist (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      article_slug TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(user_id, article_slug)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_articles_slug ON articles(slug);
     CREATE INDEX IF NOT EXISTS idx_revisions_slug ON revisions(article_slug);
     CREATE INDEX IF NOT EXISTS idx_talk_slug ON talk_messages(article_slug);
     CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_media_filename ON media(filename);
+    CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id);
+    CREATE INDEX IF NOT EXISTS idx_watchlist_slug ON watchlist(article_slug);
   `);
+
+  // Inicjalizacja FTS5 z usuwaniem polskich znaków diakrytycznych lub fallback
+  let isFts5Supported = false;
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
+        title,
+        summary,
+        content,
+        slug UNINDEXED,
+        tokenize="unicode61 remove_diacritics 1"
+      );
+    `);
+    isFts5Supported = true;
+  } catch (_) {
+    isFts5Supported = false;
+  }
+
+  if (!isFts5Supported) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS articles_fts (
+        rowid INTEGER PRIMARY KEY,
+        title TEXT NOT NULL,
+        summary TEXT DEFAULT '',
+        content TEXT NOT NULL,
+        slug TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_articles_fts_slug ON articles_fts(slug);
+    `);
+  }
+
+  // Triggery synchronizujące articles_fts przy zmianach w articles
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_articles_ai AFTER INSERT ON articles BEGIN
+      INSERT INTO articles_fts (rowid, title, summary, content, slug)
+      VALUES (new.id, new.title, new.summary, new.content, new.slug);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_articles_ad AFTER DELETE ON articles BEGIN
+      DELETE FROM articles_fts WHERE rowid = old.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_articles_au AFTER UPDATE ON articles BEGIN
+      DELETE FROM articles_fts WHERE rowid = old.id;
+      INSERT INTO articles_fts (rowid, title, summary, content, slug)
+      VALUES (new.id, new.title, new.summary, new.content, new.slug);
+    END;
+  `);
+
+  // Wypełnienie indeksu FTS jeśli istnieją już artykuły
+  try {
+    db.exec(`
+      INSERT INTO articles_fts (rowid, title, summary, content, slug)
+      SELECT id, title, summary, content, slug FROM articles
+      WHERE id NOT IN (SELECT rowid FROM articles_fts);
+    `);
+  } catch (_) {}
 
   // Funkcje pomocnicze do mapowania wierszy
   function parseArticleRow(row) {
@@ -678,9 +757,11 @@ function createWikiDb(dbPathOrOptions) {
         t.author,
         t.content,
         t.created_at,
-        a.title as article_title
+        a.title as article_title,
+        u.role as author_role
       FROM talk_messages t
       LEFT JOIN articles a ON LOWER(t.article_slug) = LOWER(a.slug)
+      LEFT JOIN users u ON LOWER(t.author) = LOWER(u.username)
       WHERE LOWER(t.article_slug) = ?
       ORDER BY t.id ASC
     `).all(cleanSlug);
@@ -691,6 +772,7 @@ function createWikiDb(dbPathOrOptions) {
       slug: r.article_slug,
       article_title: r.article_title || r.article_slug,
       author: r.author,
+      author_role: r.author_role || (r.author && r.author.toLowerCase() !== 'anonim' ? 'user' : 'anon'),
       content: r.content,
       created_at: r.created_at
     }));
@@ -713,6 +795,8 @@ function createWikiDb(dbPathOrOptions) {
     `).run(cleanSlug, cleanAuthor, cleanContent, now);
 
     const art = db.prepare('SELECT title FROM articles WHERE LOWER(slug) = ?').get(cleanSlug);
+    const user = db.prepare('SELECT role FROM users WHERE LOWER(username) = ?').get(cleanAuthor.toLowerCase());
+    const authorRole = user ? user.role : (cleanAuthor.toLowerCase() !== 'anonim' ? 'user' : 'anon');
 
     return {
       id: Number(res.lastInsertRowid),
@@ -720,6 +804,7 @@ function createWikiDb(dbPathOrOptions) {
       slug: cleanSlug,
       article_title: art ? art.title : cleanSlug,
       author: cleanAuthor,
+      author_role: authorRole,
       content: cleanContent,
       created_at: now
     };
@@ -734,9 +819,11 @@ function createWikiDb(dbPathOrOptions) {
         t.author,
         t.content,
         t.created_at,
-        a.title as article_title
+        a.title as article_title,
+        u.role as author_role
       FROM talk_messages t
       LEFT JOIN articles a ON LOWER(t.article_slug) = LOWER(a.slug)
+      LEFT JOIN users u ON LOWER(t.author) = LOWER(u.username)
       ORDER BY t.id DESC LIMIT ?
     `).all(lim);
 
@@ -746,6 +833,7 @@ function createWikiDb(dbPathOrOptions) {
       slug: r.article_slug,
       article_title: r.article_title || r.article_slug,
       author: r.author,
+      author_role: r.author_role || (r.author && r.author.toLowerCase() !== 'anonim' ? 'user' : 'anon'),
       content: r.content,
       created_at: r.created_at
     }));
@@ -992,6 +1080,7 @@ function createWikiDb(dbPathOrOptions) {
     db.prepare('DELETE FROM articles WHERE id = ?').run(current.id);
     db.prepare('DELETE FROM revisions WHERE LOWER(article_slug) = ?').run(cleanSlug);
     db.prepare('DELETE FROM talk_messages WHERE LOWER(article_slug) = ?').run(cleanSlug);
+    db.prepare('DELETE FROM watchlist WHERE LOWER(article_slug) = ?').run(cleanSlug);
 
     const now = new Date().toISOString();
     db.prepare(`
@@ -1012,6 +1101,341 @@ function createWikiDb(dbPathOrOptions) {
       target: r.target || '',
       details: r.details || '',
       created_at: r.created_at
+    }));
+  }
+
+  // --- Wyszukiwanie FTS5 (Pełnotekstowe z BM25 i snippetami) ---
+  function normalizeSearchText(str) {
+    if (!str) return '';
+    return String(str)
+      .replace(/[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]/g, c => ({
+        'ą': 'a', 'Ą': 'a', 'ć': 'c', 'Ć': 'c', 'ę': 'e', 'Ę': 'e',
+        'ł': 'l', 'Ł': 'l', 'ń': 'n', 'Ń': 'n', 'ó': 'o', 'Ó': 'o',
+        'ś': 's', 'Ś': 's', 'ź': 'z', 'Ź': 'z', 'ż': 'z', 'Ż': 'z'
+      })[c] || c)
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+  }
+
+  function createSnippet(content, summary, terms, maxLength = 160) {
+    const sourceText = content || summary || '';
+    if (!sourceText) return '';
+
+    const cleanSource = sourceText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!cleanSource) return '';
+
+    const normalizedSource = normalizeSearchText(cleanSource);
+    let bestIndex = -1;
+
+    for (const term of terms) {
+      const idx = normalizedSource.indexOf(term);
+      if (idx !== -1 && (bestIndex === -1 || idx < bestIndex)) {
+        bestIndex = idx;
+      }
+    }
+
+    let start = 0;
+    let end = cleanSource.length;
+
+    if (bestIndex !== -1) {
+      start = Math.max(0, bestIndex - 40);
+      end = Math.min(cleanSource.length, start + maxLength);
+      if (start > 0) {
+        const spaceIdx = cleanSource.indexOf(' ', start);
+        if (spaceIdx !== -1 && spaceIdx < start + 20) start = spaceIdx + 1;
+      }
+    } else {
+      end = Math.min(cleanSource.length, maxLength);
+    }
+
+    let snippetPart = cleanSource.slice(start, end).trim();
+    if (start > 0) snippetPart = '...' + snippetPart;
+    if (end < cleanSource.length) snippetPart = snippetPart + '...';
+
+    let escapedSnippet = snippetPart
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+
+    const diacriticMap = {
+      'a': '[aąAĄ]', 'c': '[cćCĆ]', 'e': '[eęEĘ]', 'l': '[lłLŁ]',
+      'n': '[nńNŃ]', 'o': '[oóOÓ]', 's': '[sśSŚ]', 'z': '[zźżZŹŻ]'
+    };
+
+    for (const term of terms) {
+      if (term.length >= 2) {
+        const norm = normalizeSearchText(term);
+        let pattern = '';
+        for (const ch of norm) {
+          if (diacriticMap[ch]) {
+            pattern += diacriticMap[ch];
+          } else {
+            pattern += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          }
+        }
+        if (pattern) {
+          const regex = new RegExp(`(${pattern})`, 'gi');
+          escapedSnippet = escapedSnippet.replace(regex, '<mark class="search-highlight">$1</mark>');
+        }
+      }
+    }
+
+    return escapedSnippet;
+  }
+
+  function searchArticlesFTS(query, { limit = 20 } = {}) {
+    if (!query || typeof query !== 'string') return [];
+
+    // Oczyszczenie zapytania: usuwamy operatory FTS5, nawiasy, cudzysłowy i znaki specjalne
+    const cleanedQuery = String(query)
+      .replace(/["'*^:(){}[\]\\~+\-?]/g, ' ')
+      .replace(/\b(AND|OR|NOT|NEAR)\b/gi, ' ')
+      .trim();
+
+    // Wymóg minimalnej długości: minimum 2 znaki
+    if (cleanedQuery.length < 2) return [];
+
+    const rawTokens = cleanedQuery.split(/\s+/).map(t => t.trim()).filter(Boolean);
+    if (rawTokens.length === 0) return [];
+
+    const lim = Math.max(1, Math.min(100, Number(limit) || 20));
+
+    if (isFts5Supported) {
+      try {
+        // Każdy token opakowujemy w cudzysłowy: "token"* i łączymy przez AND
+        const ftsQuery = rawTokens.map(t => `"${t.replace(/"/g, '')}"*`).join(' AND ');
+
+        const ftsRows = db.prepare(`
+          SELECT
+            a.id,
+            a.title,
+            a.slug,
+            a.summary,
+            a.content,
+            bm25(articles_fts) as rank,
+            snippet(articles_fts, 2, '<mark class="search-highlight">', '</mark>', '...', 25) as snippet
+          FROM articles_fts
+          JOIN articles a ON articles_fts.rowid = a.id
+          WHERE articles_fts MATCH ? AND a.is_published = 1
+          ORDER BY rank ASC
+          LIMIT ?
+        `).all(ftsQuery, lim);
+
+        if (ftsRows.length > 0) {
+          return ftsRows.map(r => ({
+            id: Number(r.id),
+            slug: r.slug,
+            title: r.title,
+            summary: r.summary || '',
+            rank: Math.abs(Number(r.rank || 0)),
+            snippet: r.snippet || (r.summary || r.title)
+          }));
+        }
+      } catch (_) {}
+    }
+
+    const normWords = rawTokens.map(normalizeSearchText).filter(w => w.length > 0);
+    if (normWords.length === 0) return [];
+
+    const rows = db.prepare(`
+      SELECT id, title, slug, summary, content
+      FROM articles
+      WHERE is_published = 1
+    `).all();
+
+    const scored = [];
+
+    for (const r of rows) {
+      const normTitle = normalizeSearchText(r.title);
+      const normSummary = normalizeSearchText(r.summary || '');
+      const normContent = normalizeSearchText(r.content || '');
+
+      let score = 0;
+      let matched = false;
+
+      for (const w of normWords) {
+        let wordMatches = 0;
+        if (normTitle.includes(w)) {
+          score += 20;
+          wordMatches++;
+        }
+        if (normSummary.includes(w)) {
+          score += 10;
+          wordMatches++;
+        }
+        if (normContent.includes(w)) {
+          const occurrences = (normContent.split(w).length - 1);
+          score += Math.min(occurrences * 3, 30);
+          wordMatches++;
+        }
+        if (wordMatches > 0) {
+          matched = true;
+        }
+      }
+
+      if (matched && score > 0) {
+        scored.push({
+          id: Number(r.id),
+          slug: r.slug,
+          title: r.title,
+          summary: r.summary || '',
+          rank: score,
+          snippet: createSnippet(r.content, r.summary, rawTokens)
+        });
+      }
+    }
+
+    scored.sort((a, b) => b.rank - a.rank);
+    return scored.slice(0, lim);
+  }
+
+  // --- Zarządzanie multimediami (Media) ---
+  function addMedia({ filename, original_name, mime_type, size_bytes, uploader = 'admin' }) {
+    if (!filename || !original_name || !mime_type) {
+      throw new Error('Nazwa pliku, oryginalna nazwa i typ MIME są wymagane.');
+    }
+    const cleanFilename = String(filename).trim();
+    const cleanOrigName = String(original_name).trim();
+    const cleanMime = String(mime_type).trim().toLowerCase();
+    const size = Number(size_bytes || 0);
+    const cleanUploader = String(uploader || 'admin').trim();
+    const now = new Date().toISOString();
+
+    const res = db.prepare(`
+      INSERT INTO media (filename, original_name, mime_type, size_bytes, uploader, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(cleanFilename, cleanOrigName, cleanMime, size, cleanUploader, now);
+
+    db.prepare(`
+      INSERT INTO audit_logs (action, actor, target, details, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run('media_upload', cleanUploader, cleanFilename, `${cleanOrigName} (${cleanMime}, ${size} B)`, now);
+
+    return {
+      id: Number(res.lastInsertRowid),
+      filename: cleanFilename,
+      original_name: cleanOrigName,
+      mime_type: cleanMime,
+      size_bytes: size,
+      uploader: cleanUploader,
+      created_at: now,
+      url: `/uploads/${cleanFilename}`
+    };
+  }
+
+  function listMedia({ limit = 50 } = {}) {
+    const lim = Math.max(1, Math.min(200, Number(limit) || 50));
+    const rows = db.prepare('SELECT * FROM media ORDER BY id DESC LIMIT ?').all(lim);
+    return rows.map(r => ({
+      id: Number(r.id),
+      filename: r.filename,
+      original_name: r.original_name,
+      mime_type: r.mime_type,
+      size_bytes: Number(r.size_bytes),
+      uploader: r.uploader,
+      created_at: r.created_at,
+      url: `/uploads/${r.filename}`
+    }));
+  }
+
+  function getMediaByFilename(filename) {
+    if (!filename) return null;
+    const row = db.prepare('SELECT * FROM media WHERE filename = ?').get(String(filename).trim());
+    if (!row) return null;
+    return {
+      id: Number(row.id),
+      filename: row.filename,
+      original_name: row.original_name,
+      mime_type: row.mime_type,
+      size_bytes: Number(row.size_bytes),
+      uploader: row.uploader,
+      created_at: row.created_at,
+      url: `/uploads/${row.filename}`
+    };
+  }
+
+  // --- Lista obserwowanych artykułów (Watchlist) ---
+  function toggleWatchlist(userId, slug) {
+    if (!userId || !slug) throw new Error('Brak ID użytkownika lub slug artykułu.');
+    const uId = Number(userId);
+    const cleanSlug = String(slug).trim().toLowerCase();
+
+    const existing = db.prepare('SELECT id FROM watchlist WHERE user_id = ? AND LOWER(article_slug) = ?').get(uId, cleanSlug);
+
+    if (existing) {
+      db.prepare('DELETE FROM watchlist WHERE id = ?').run(existing.id);
+      return { watching: false, slug: cleanSlug };
+    } else {
+      const now = new Date().toISOString();
+      db.prepare('INSERT INTO watchlist (user_id, article_slug, created_at) VALUES (?, ?, ?)').run(uId, cleanSlug, now);
+      return { watching: true, slug: cleanSlug };
+    }
+  }
+
+  function isWatching(userId, slug) {
+    if (!userId || !slug) return false;
+    const uId = Number(userId);
+    const cleanSlug = String(slug).trim().toLowerCase();
+    const row = db.prepare('SELECT id FROM watchlist WHERE user_id = ? AND LOWER(article_slug) = ?').get(uId, cleanSlug);
+    return Boolean(row);
+  }
+
+  function getWatchlistArticles(userId) {
+    if (!userId) return [];
+    const uId = Number(userId);
+    const rows = db.prepare(`
+      SELECT a.*
+      FROM watchlist w
+      JOIN articles a ON LOWER(w.article_slug) = LOWER(a.slug)
+      WHERE w.user_id = ? AND a.is_published = 1
+      ORDER BY a.title ASC
+    `).all(uId);
+
+    return rows.map(parseArticleRow);
+  }
+
+  function getWatchlistRecentChanges(userId, limit = 20, { includeUnpublished = false } = {}) {
+    if (!userId) return [];
+    const uId = Number(userId);
+    const lim = Math.max(1, Math.min(100, Number(limit) || 20));
+
+    const publishCondition = includeUnpublished ? '' : 'AND a.is_published = 1';
+
+    const rows = db.prepare(`
+      SELECT
+        r.id,
+        r.article_slug,
+        r.title,
+        r.summary,
+        r.editor,
+        r.edit_comment,
+        r.created_at,
+        length(r.content) as content_length,
+        a.is_locked,
+        a.is_featured,
+        a.is_published
+      FROM revisions r
+      JOIN watchlist w ON LOWER(r.article_slug) = LOWER(w.article_slug)
+      JOIN articles a ON LOWER(r.article_slug) = LOWER(a.slug)
+      WHERE w.user_id = ? ${publishCondition}
+      ORDER BY r.id DESC LIMIT ?
+    `).all(uId, lim);
+
+    return rows.map(r => ({
+      id: Number(r.id),
+      slug: r.article_slug,
+      article_slug: r.article_slug,
+      title: r.title,
+      summary: r.summary || '',
+      editor: r.editor,
+      edit_comment: r.edit_comment || '',
+      created_at: r.created_at,
+      content_length: Number(r.content_length || 0),
+      is_locked: Number(r.is_locked || 0),
+      is_featured: Number(r.is_featured || 0),
+      is_published: Number(r.is_published == null ? 1 : r.is_published)
     }));
   }
 
@@ -1426,7 +1850,15 @@ W 1903 roku otrzymała Nagrodę Nobla z fizyki, a w 1911 roku samodzielną Nagro
     updateUserRole,
     updateArticleAdminStatus,
     deleteArticle,
-    getAuditLogs
+    getAuditLogs,
+    searchArticlesFTS,
+    addMedia,
+    listMedia,
+    getMediaByFilename,
+    toggleWatchlist,
+    isWatching,
+    getWatchlistArticles,
+    getWatchlistRecentChanges
   };
 
   return dbApi;

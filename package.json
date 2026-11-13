@@ -1,7 +1,7 @@
 {
   "name": "wiki-kurekk",
-  "version": "1.0.0",
-  "description": "WikiKurekk - Lekka encyklopedia wiki z systemem rewizji i dyskusji",
+  "version": "2.0.0-prod-2",
+  "description": "WikiKurekk prod-2 - Zaawansowana encyklopedia wiki z systemem rewizji, dyskusji i testami E2E",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",

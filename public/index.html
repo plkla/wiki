@@ -25,6 +25,67 @@
     html[data-theme="dark"] .search-suggestion-item.active {
       background-color: #334155 !important;
     }
+    .search-highlight {
+      background-color: #fef08a;
+      color: #1e293b;
+      font-weight: 600;
+      padding: 0 2px;
+      border-radius: 2px;
+    }
+    html[data-theme="dark"] .search-highlight {
+      background-color: #854d0e;
+      color: #fef08a;
+    }
+    .btn-watch {
+      font-size: 0.85rem;
+    }
+    .btn-watching {
+      background-color: #fef3c7;
+      color: #b45309;
+      border-color: #fcd34d;
+    }
+    html[data-theme="dark"] .btn-watching {
+      background-color: #78350f;
+      color: #fde68a;
+      border-color: #92400e;
+    }
+    .editor-mode-bar {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+    .editor-mode-btn.active {
+      background-color: #2563eb;
+      color: #ffffff;
+      border-color: #2563eb;
+    }
+    .editor-split-container {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+    }
+    .editor-split-pane {
+      flex: 1;
+      min-width: 0;
+    }
+    .editor-preview-pane {
+      flex: 1;
+      min-width: 0;
+      border: 1px solid var(--wiki-border);
+      border-radius: 4px;
+      padding: 16px 20px;
+      background-color: var(--wiki-content-bg);
+      overflow-y: auto;
+      max-height: 850px;
+    }
+    @media (max-width: 960px) {
+      .editor-split-container {
+        flex-direction: column;
+      }
+      .editor-preview-pane {
+        max-height: none;
+      }
+    }
     .skip-link {
       position: absolute;
       top: -60px;
@@ -50,11 +111,230 @@
     .wiki-toc.collapsed .toc-list {
       display: none;
     }
+    /* Style dla modernizacji Edytora, Trybu Zen i Strony Dyskusji */
+    .zen-exit-btn {
+      display: none;
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 10000;
+      background: rgba(30, 41, 59, 0.9);
+      color: #ffffff;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 20px;
+      padding: 8px 16px;
+      font-size: 0.85rem;
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+      transition: all 0.2s ease;
+    }
+    body.editor-zen-active .zen-exit-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    body.editor-zen-active .wiki-header,
+    body.editor-zen-active .wiki-sidebar,
+    body.editor-zen-active .wiki-footer {
+      display: none !important;
+    }
+    body.editor-zen-active .wiki-main {
+      max-width: 100vw !important;
+      margin: 0 !important;
+      padding: 24px !important;
+    }
+    body.editor-zen-active .editor-split-container {
+      min-height: 85vh;
+    }
+    .slug-preview-badge {
+      display: inline-block;
+      font-size: 0.82rem;
+      font-family: monospace;
+      color: var(--wiki-text-muted, #64748b);
+      background-color: var(--wiki-hover-bg, #f1f5f9);
+      padding: 3px 8px;
+      border-radius: 4px;
+      border: 1px dashed var(--wiki-border, #cbd5e1);
+      margin-top: 4px;
+    }
+    .editor-header-metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-top: 8px;
+      font-size: 0.82rem;
+    }
+    .word-counter-badge, .char-counter-badge, .reading-time-badge {
+      background-color: var(--wiki-hover-bg, #f1f5f9);
+      color: var(--wiki-text-muted, #475569);
+      padding: 2px 8px;
+      border-radius: 12px;
+      border: 1px solid var(--wiki-border, #e2e8f0);
+    }
+    .sticky-toolbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background-color: var(--wiki-content-bg, #ffffff);
+      padding: 8px;
+      border-radius: 4px;
+      border: 1px solid var(--wiki-border, #e2e8f0);
+      margin-bottom: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .toolbar-icon-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 10px;
+      font-size: 0.85rem;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .toolbar-icon-btn svg {
+      flex-shrink: 0;
+    }
+    .category-chips-container {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .category-chips-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .category-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background-color: var(--wiki-tag-bg, #e0f2fe);
+      color: var(--wiki-tag-text, #0369a1);
+      border: 1px solid var(--wiki-tag-border, #bae6fd);
+      border-radius: 16px;
+      padding: 3px 10px;
+      font-size: 0.85rem;
+      font-weight: 500;
+    }
+    .category-chip-remove {
+      background: none;
+      border: none;
+      color: inherit;
+      cursor: pointer;
+      padding: 0;
+      font-size: 1.1rem;
+      line-height: 1;
+      opacity: 0.7;
+    }
+    .category-chip-remove:hover {
+      opacity: 1;
+    }
+    .category-suggestions {
+      font-size: 0.82rem;
+      color: var(--wiki-text-muted, #64748b);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .category-suggestion-pill {
+      background: none;
+      border: 1px dashed var(--wiki-border, #cbd5e1);
+      border-radius: 12px;
+      padding: 2px 8px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      color: var(--wiki-link, #2563eb);
+      transition: background 0.15s ease;
+    }
+    .category-suggestion-pill:hover {
+      background-color: var(--wiki-hover-bg, #f1f5f9);
+    }
+    .category-suggestion-pill.selected {
+      opacity: 0.5;
+      text-decoration: line-through;
+      pointer-events: none;
+    }
+    .infobox-templates-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 8px;
+      margin: 8px 0 14px 0;
+    }
+    .infobox-template-btn {
+      text-align: center;
+      font-size: 0.82rem;
+      padding: 6px 10px;
+      cursor: pointer;
+    }
+    .talk-message-card {
+      border: 1px solid var(--wiki-border, #e2e8f0);
+      border-radius: 6px;
+      padding: 14px;
+      margin-bottom: 12px;
+      background: var(--wiki-card-bg, #ffffff);
+    }
+    .talk-role-badge {
+      display: inline-block;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 10px;
+      margin-left: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .talk-role-badge.role-admin {
+      background-color: #f3e8ff;
+      color: #7e22ce;
+      border: 1px solid #d8b4fe;
+    }
+    .talk-role-badge.role-editor {
+      background-color: #dbeafe;
+      color: #1d4ed8;
+      border: 1px solid #bfdbfe;
+    }
+    .talk-role-badge.role-user {
+      background-color: #dcfce7;
+      color: #15803d;
+      border: 1px solid #bbf7d0;
+    }
+    .talk-role-badge.role-anon {
+      background-color: #f1f5f9;
+      color: #64748b;
+      border: 1px solid #e2e8f0;
+    }
+    .talk-quote-block {
+      border-left: 4px solid var(--wiki-border, #cbd5e1);
+      margin: 8px 0;
+      padding: 6px 12px;
+      background: var(--wiki-hover-bg, #f8fafc);
+      color: var(--wiki-text-muted, #475569);
+      font-style: italic;
+      border-radius: 0 4px 4px 0;
+    }
+    .talk-mini-toolbar {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 6px;
+    }
   </style>
 </head>
 <body>
+  <!-- Pływający przycisk wyjścia z trybu Zen -->
+  <button type="button" id="zen-exit-floating-btn" class="zen-exit-btn" title="Wyjdź z trybu Zen (Esc)">✕ Wyjdź z trybu Zen (Esc)</button>
+
   <!-- Link bezpośredniego przejścia do treści (dostępność WCAG) -->
   <a href="#view-root" class="skip-link">Przejdź do treści głównej</a>
+
+  <!-- Ukryty input do wgrywania plików graficznych w edytorze -->
+  <input type="file" id="editor-file-upload" accept="image/png,image/jpeg,image/webp,image/svg+xml" class="hidden" />
 
   <!-- Baner ogłoszeniowy na samej górze witryny -->
   <div id="announcement-banner" class="announcement-banner hidden" role="region" aria-label="Ogłoszenie witryny"></div>
@@ -90,6 +370,7 @@
       <!-- Pasek użytkownika po prawej -->
       <nav class="wiki-user-nav" aria-label="Narzędzia osobiste">
         <button id="theme-toggle-btn" type="button" class="user-nav-link" title="Przełącz motyw jasny / ciemny" aria-label="Przełącz motyw">Ciemny motyw</button>
+        <a href="#/watchlist" id="nav-watchlist-top" class="user-nav-link hidden" aria-label="Obserwowane artykuły">Obserwowane</a>
         <span id="user-badge" class="user-badge hidden" aria-label="Zalogowany użytkownik"></span>
         <a href="#/panel" id="nav-admin-top" class="user-nav-link hidden" aria-label="Panel administracyjny">Panel</a>
         <button id="auth-modal-btn" type="button" class="user-nav-link">Zaloguj się</button>
@@ -108,6 +389,7 @@
         <a href="#/" class="nav-link" data-route="home">Strona główna</a>
         <a href="#/articles" class="nav-link" data-route="articles">Wszystkie artykuły</a>
         <a href="#/categories" class="nav-link" data-route="categories">Kategorie</a>
+        <a href="#/watchlist" class="nav-link" data-route="watchlist" id="sidebar-watchlist-link">Obserwowane</a>
         <a href="#/recent-changes" class="nav-link" data-route="recent-changes">Ostatnie zmiany</a>
         <button id="random-article-btn" class="nav-link-btn" type="button">Losuj artykuł</button>
 

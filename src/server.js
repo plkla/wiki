@@ -69,6 +69,159 @@ function parseJsonBody(req) {
   });
 }
 
+function parseUploadPayload(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalLength = 0;
+    req.on('data', chunk => {
+      chunks.push(chunk);
+      totalLength += chunk.length;
+      if (totalLength > 10 * 1024 * 1024) {
+        req.destroy();
+        const err = new Error('Payload too large');
+        err.statusCode = 413;
+        reject(err);
+      }
+    });
+    req.on('end', () => {
+      const buffer = Buffer.concat(chunks);
+      const contentType = req.headers['content-type'] || '';
+
+      // JSON z danymi base64 lub data URL
+      if (contentType.includes('application/json')) {
+        try {
+          const json = JSON.parse(buffer.toString('utf8'));
+          const rawData = String(json.data || '');
+          const base64Data = rawData.replace(/^data:[^;]+;base64,/, '');
+          const fileBuffer = Buffer.from(base64Data, 'base64');
+          return resolve({
+            filename: json.filename || 'upload.png',
+            original_name: json.original_name || json.filename || 'upload.png',
+            mime_type: json.mime_type || 'image/png',
+            buffer: fileBuffer
+          });
+        } catch (e) {
+          return reject(new Error('Invalid JSON'));
+        }
+      }
+
+      // Multipart form-data
+      if (contentType.includes('multipart/form-data')) {
+        const boundaryMatch = contentType.match(/boundary=([^;]+)/i);
+        if (boundaryMatch) {
+          const boundary = boundaryMatch[1].trim().replace(/^"|"$/g, '');
+          const delimiter = `--${boundary}`;
+          const parts = buffer.toString('latin1').split(delimiter);
+
+          for (const part of parts) {
+            if (part.includes('filename="') || part.includes('filename=')) {
+              const headerEnd = part.indexOf('\r\n\r\n');
+              if (headerEnd === -1) continue;
+              const headers = part.slice(0, headerEnd);
+              const filenameMatch = headers.match(/filename="?([^"\r\n]+)"?/i);
+              const mimeMatch = headers.match(/Content-Type:\s*([^\r\n]+)/i);
+              const filename = filenameMatch ? filenameMatch[1] : 'upload.png';
+              const mimeType = mimeMatch ? mimeMatch[1].trim() : 'image/png';
+
+              const bodyStart = headerEnd + 4;
+              let bodyEnd = part.lastIndexOf('\r\n');
+              if (bodyEnd === -1 || bodyEnd < bodyStart) bodyEnd = part.length;
+
+              const fileLatin1 = part.slice(bodyStart, bodyEnd);
+              const fileBuffer = Buffer.from(fileLatin1, 'latin1');
+              return resolve({
+                filename,
+                original_name: filename,
+                mime_type: mimeType,
+                buffer: fileBuffer
+              });
+            }
+          }
+        }
+      }
+
+      // Raw binary z nagłówkami
+      const filename = req.headers['x-filename'] || 'upload.png';
+      const mime_type = req.headers['content-type'] || 'image/png';
+      resolve({
+        filename,
+        original_name: filename,
+        mime_type,
+        buffer
+      });
+    });
+    req.on('error', reject);
+  });
+}
+
+function validateAndSanitizeMedia(buffer, declaredMime) {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) {
+    return { valid: false, error: 'Brak danych pliku.' };
+  }
+
+  let mime = (declaredMime || '').toLowerCase().trim();
+  if (mime === 'image/jpg') mime = 'image/jpeg';
+
+  // 1. PNG: 89 50 4E 47 0D 0A 1A 0A
+  const isPng = buffer.length >= 8 &&
+    buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47 &&
+    buffer[4] === 0x0D && buffer[5] === 0x0A && buffer[6] === 0x1A && buffer[7] === 0x0A;
+
+  // 2. JPEG: FF D8 FF
+  const isJpeg = buffer.length >= 3 &&
+    buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF;
+
+  // 3. WebP: 52 49 46 46 (RIFF) at offset 0, and 57 45 42 50 (WEBP) at offset 8
+  const isWebp = buffer.length >= 12 &&
+    buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+    buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50;
+
+  // 4. SVG: text containing <svg tag
+  let isSvg = false;
+  let sanitizedBuffer = buffer;
+
+  if (mime === 'image/svg+xml') {
+    const text = buffer.toString('utf8');
+    if (/<svg[\s>]/i.test(text)) {
+      isSvg = true;
+      // Sanitize SVG: strip script, iframe, object, embed, inline event handlers, and javascript: links
+      let sanitized = text
+        .replace(/<script[\s\S]*?<\/script\s*>/gi, '')
+        .replace(/<script[^>]*\/>/gi, '')
+        .replace(/<iframe[\s\S]*?<\/iframe\s*>/gi, '')
+        .replace(/<iframe[^>]*\/>/gi, '')
+        .replace(/<object[\s\S]*?<\/object\s*>/gi, '')
+        .replace(/<object[^>]*\/>/gi, '')
+        .replace(/<embed[\s\S]*?<\/embed\s*>/gi, '')
+        .replace(/<embed[^>]*\/>/gi, '')
+        .replace(/\s+on[a-zA-Z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+        .replace(/(?:href|xlink:href)\s*=\s*(?:"javascript:[^"]*"|'javascript:[^']*')/gi, '');
+
+      sanitizedBuffer = Buffer.from(sanitized, 'utf8');
+    }
+  }
+
+  // Weryfikacja zgodności z zadeklarowanym MIME
+  if (mime === 'image/png') {
+    if (!isPng) return { valid: false, error: 'Zawartość pliku nie odpowiada deklarowanemu formatowi PNG (błędna sygnatura magic bytes).' };
+    return { valid: true, mimeType: 'image/png', buffer };
+  }
+  if (mime === 'image/jpeg') {
+    if (!isJpeg) return { valid: false, error: 'Zawartość pliku nie odpowiada deklarowanemu formatowi JPEG (błędna sygnatura magic bytes).' };
+    return { valid: true, mimeType: 'image/jpeg', buffer };
+  }
+  if (mime === 'image/webp') {
+    if (!isWebp) return { valid: false, error: 'Zawartość pliku nie odpowiada deklarowanemu formatowi WebP (błędna sygnatura RIFF/WEBP).' };
+    return { valid: true, mimeType: 'image/webp', buffer };
+  }
+  if (mime === 'image/svg+xml') {
+    if (!isSvg) return { valid: false, error: 'Zawartość pliku nie jest poprawnym dokumentem SVG.' };
+    return { valid: true, mimeType: 'image/svg+xml', buffer: sanitizedBuffer };
+  }
+
+  return { valid: false, error: 'Niedozwolony format pliku. Dozwolone: PNG, JPG, WEBP, SVG.' };
+}
+
 function sendJson(res, statusCode, data) {
   const json = JSON.stringify(data);
   res.writeHead(statusCode, {
@@ -142,11 +295,15 @@ function serveStatic(req, res, pathname) {
   if (stat && stat.isFile()) {
     const ext = path.extname(filePath).toLowerCase();
     const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-    res.writeHead(200, {
+    const headers = {
       'Content-Type': contentType,
       'Content-Length': stat.size,
       'Access-Control-Allow-Origin': '*'
-    });
+    };
+    if (ext === '.svg' && (pathname.startsWith('/uploads/') || filePath.includes('/uploads/'))) {
+      headers['Content-Security-Policy'] = "default-src 'none'; style-src 'unsafe-inline'";
+    }
+    res.writeHead(200, headers);
     if (req.method === 'HEAD') {
       res.end();
       return;
@@ -235,7 +392,7 @@ function createWikiServer({ dbPath } = {}) {
     const { token, user: currentUser } = getAuthUser(req, sessions, db);
 
     let body = {};
-    if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
+    if (['POST', 'PUT', 'PATCH'].includes(req.method) && pathname !== '/api/upload') {
       try {
         body = await parseJsonBody(req);
       } catch (err) {
@@ -446,6 +603,137 @@ function createWikiServer({ dbPath } = {}) {
         });
       }
 
+      // 5.1. POST /api/upload (Wgrywanie plików graficznych)
+      if (pathname === '/api/upload' && req.method === 'POST') {
+        if (!currentUser) {
+          return sendError(res, 401, 'Wymagane logowanie, aby przesłać plik.');
+        }
+        if (currentUser.role === 'blocked') {
+          return sendError(res, 403, 'Konto zablokowane.');
+        }
+
+        try {
+          const fileData = await parseUploadPayload(req);
+          if (!fileData || !fileData.buffer || fileData.buffer.length === 0) {
+            return sendError(res, 400, 'Brak danych pliku.');
+          }
+
+          if (fileData.buffer.length > 5 * 1024 * 1024) {
+            return sendError(res, 413, 'Plik przekracza dozwolony limit wielkości (5 MB).');
+          }
+
+          const ALLOWED_MIME_TYPES = new Set([
+            'image/png',
+            'image/jpeg',
+            'image/jpg',
+            'image/webp',
+            'image/svg+xml'
+          ]);
+
+          let mimeType = (fileData.mime_type || '').toLowerCase();
+          if (!ALLOWED_MIME_TYPES.has(mimeType)) {
+            const ext = path.extname(fileData.filename).toLowerCase();
+            const mimeByExt = MIME_TYPES[ext];
+            if (mimeByExt && ALLOWED_MIME_TYPES.has(mimeByExt)) {
+              mimeType = mimeByExt;
+            } else {
+              return sendError(res, 400, 'Niedozwolony format pliku. Dozwolone: PNG, JPG, WEBP, SVG.');
+            }
+          }
+
+          // Walidacja magic bytes i sanityzacja SVG
+          const validation = validateAndSanitizeMedia(fileData.buffer, mimeType);
+          if (!validation.valid) {
+            return sendError(res, 400, validation.error);
+          }
+
+          const finalBuffer = validation.buffer;
+          const finalMimeType = validation.mimeType;
+
+          const origName = path.basename(fileData.original_name || fileData.filename || 'obraz.png');
+          const ext = path.extname(origName).toLowerCase() || (finalMimeType === 'image/svg+xml' ? '.svg' : '.png');
+          const baseWithoutExt = path.basename(origName, ext);
+          const safeSlug = slugify(baseWithoutExt) || 'obraz';
+          const uniqueFilename = `${safeSlug}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}${ext}`;
+
+          const uploadsDir = path.join(PUBLIC_DIR, 'uploads');
+          if (!fs.existsSync(uploadsDir)) {
+            fs.mkdirSync(uploadsDir, { recursive: true });
+          }
+
+          fs.writeFileSync(path.join(uploadsDir, uniqueFilename), finalBuffer);
+
+          const media = db.addMedia({
+            filename: uniqueFilename,
+            original_name: origName,
+            mime_type: finalMimeType,
+            size_bytes: finalBuffer.length,
+            uploader: currentUser.username
+          });
+
+          return sendJson(res, 201, {
+            media,
+            url: media.url
+          });
+        } catch (err) {
+          if (err.statusCode === 413) {
+            return sendError(res, 413, 'Plik przekracza dozwolony limit wielkości (5 MB).');
+          }
+          return sendError(res, 400, err.message || 'Błąd podczas wgrywania pliku.');
+        }
+      }
+
+      // 5.2. GET /api/media (Lista multimediów)
+      if (pathname === '/api/media' && req.method === 'GET') {
+        const limit = parseInt(query.limit, 10) || 50;
+        const media = db.listMedia ? db.listMedia({ limit }) : [];
+        return sendJson(res, 200, { media });
+      }
+
+      // 5.3. GET /api/search (Wyszukiwanie pełnotekstowe FTS5 / BM25)
+      if (pathname === '/api/search' && req.method === 'GET') {
+        const q = query.q || '';
+        const limit = parseInt(query.limit, 10) || 20;
+        const results = db.searchArticlesFTS ? db.searchArticlesFTS(q, { limit }) : [];
+        return sendJson(res, 200, { query: q, results, articles: results });
+      }
+
+      // 5.4. Watchlist (Obserwowane artykuły)
+      const watchlistToggleMatch = pathname.match(/^\/api\/watchlist\/([^/]+)\/toggle$/);
+      if (watchlistToggleMatch && req.method === 'POST') {
+        if (!currentUser) {
+          return sendError(res, 401, 'Wymagane logowanie.');
+        }
+        if (currentUser.role === 'blocked') {
+          return sendError(res, 403, 'Konto zablokowane.');
+        }
+        const slug = safeDecode(watchlistToggleMatch[1]);
+        const article = db.getArticleBySlug(slug, { includeUnpublished: true });
+        if (!article) {
+          return sendError(res, 404, 'Artykuł nie został odnaleziony.');
+        }
+        const result = db.toggleWatchlist(currentUser.id, slug);
+        return sendJson(res, 200, result);
+      }
+
+      if (pathname === '/api/watchlist' && req.method === 'GET') {
+        if (!currentUser) {
+          return sendError(res, 401, 'Wymagane logowanie.');
+        }
+        const articles = db.getWatchlistArticles(currentUser.id);
+        return sendJson(res, 200, { articles });
+      }
+
+      if (pathname === '/api/watchlist/changes' && req.method === 'GET') {
+        if (!currentUser) {
+          return sendError(res, 401, 'Wymagane logowanie.');
+        }
+        const isAdmin = currentUser.role === 'admin';
+        const limit = parseInt(query.limit, 10) || 20;
+        const changes = db.getWatchlistRecentChanges(currentUser.id, limit, { includeUnpublished: isAdmin });
+        return sendJson(res, 200, { changes });
+      }
+
       // 6. GET /api/recent-changes
       if (pathname === '/api/recent-changes' && req.method === 'GET') {
         const isAdmin = currentUser && currentUser.role === 'admin';
@@ -481,6 +769,7 @@ function createWikiServer({ dbPath } = {}) {
           const { html, toc, references } = renderWikiContent(article.content || '', allSlugs);
           const revisions = db.getRevisions ? db.getRevisions(slug) : [];
           const talkMessages = db.getTalkMessages ? db.getTalkMessages(slug) : [];
+          const isWatching = currentUser && db.isWatching ? db.isWatching(currentUser.id, slug) : false;
 
           return sendJson(res, 200, {
             article,
@@ -488,7 +777,8 @@ function createWikiServer({ dbPath } = {}) {
             toc,
             references,
             revisionsCount: revisions.length,
-            talkCount: talkMessages.length
+            talkCount: talkMessages.length,
+            isWatching
           });
         }
 

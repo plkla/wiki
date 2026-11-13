@@ -177,6 +177,27 @@ echo "$1" && grep -E "foo|bar"
       assert.equal(allDeleted[0].type, 'del');
     });
   });
+
+  describe('renderFigure i parsowanie grafik wiki', () => {
+    test('parsuje [[Plik:...]] i [[File:...]] do semantycznego <figure> z klasami i podpisem', () => {
+      const input = `
+== Sekcja z grafiką ==
+Oto opis z grafiką:
+[[Plik:kopernik.jpg|miniaturka|prawo|Mikołaj Kopernik w Toruniu]]
+I kolejna grafika:
+[[File:diagram.svg|thumb|left|Schemat działania]]
+`;
+      const result = renderWikiContent(input, new Set());
+
+      assert.ok(result.html.includes('<figure class="wiki-figure wiki-figure-thumb wiki-figure-right">'), 'Powinien wyrenderować figure z klasami thumb i right');
+      assert.ok(result.html.includes('src="/uploads/kopernik.jpg"'), 'Ścieżka obrazu powinna wskazywać na /uploads/kopernik.jpg');
+      assert.ok(result.html.includes('alt="Mikołaj Kopernik w Toruniu"'), 'Atrybut alt powinien zawierać podpis');
+      assert.ok(result.html.includes('<figcaption class="wiki-figcaption">Mikołaj Kopernik w Toruniu</figcaption>'), 'Powinien zawierać figcaption z podpisem');
+
+      assert.ok(result.html.includes('wiki-figure-left'), 'Druga grafika powinna mieć klasę wiki-figure-left');
+      assert.ok(result.html.includes('src="/uploads/diagram.svg"'), 'Druga grafika powinna wskazywać na /uploads/diagram.svg');
+    });
+  });
 });
 
 // =============================================================================
@@ -263,6 +284,14 @@ describe('2. Baza danych (src/db.js)', () => {
       content: 'Czy możemy zaktualizować dane o ludności?'
     });
     assert.ok(msg && msg.id, 'Wiadomość talk powinna mieć id');
+    assert.ok('author_role' in msg, 'Wiadomość talk powinna mieć przypisaną rolę autora');
+
+    const adminMsg = db.addTalkMessage(slug, {
+      author: 'admin',
+      content: 'Komentarz administratora.'
+    });
+    assert.equal(adminMsg.author_role, 'admin', 'Rola administratora powinna być rozpoznana');
+    db.deleteTalkMessage(adminMsg.id, 'admin');
 
     const messages = db.getTalkMessages(slug);
     assert.ok(messages.some(m => m.id === msg.id), 'Wiadomość powinna być w liście wątku');
@@ -413,6 +442,160 @@ describe('2. Baza danych (src/db.js)', () => {
       db.updateUserRole(1, 'hacker');
     }, /Nieprawidłowa rola/);
   });
+
+  test('wyszukiwanie pełnotekstowe FTS5 / BM25 oraz podświetlanie fragmentów (snippet)', () => {
+    // 1. Wyszukiwanie hasła "Kopernik"
+    const results = db.searchArticlesFTS('Kopernik');
+    assert.ok(Array.isArray(results), 'Wynik wyszukiwania musi być tablicą');
+    assert.ok(results.length > 0, 'Powinien znaleźć co najmniej jeden artykuł dla Kopernik');
+    const kopernik = results.find(r => r.slug === 'mikolaj-kopernik');
+    assert.ok(kopernik, 'Powinien odnaleźć artykuł mikolaj-kopernik');
+    assert.ok(kopernik.rank > 0, 'Wynik powinien mieć obliczony ranking/wagę');
+    assert.ok(kopernik.snippet.includes('<mark class="search-highlight">'), 'Snippet powinien zawierać podświetlenie <mark>');
+    assert.ok(/<mark class="search-highlight">Kopernik<\/mark>/i.test(kopernik.snippet), 'Snippet powinien wyróżniać szukane słowo');
+
+    // 2. Wyszukiwanie niewrażliwe na polskie znaki diakrytyczne (np. "sklodowska" znajdzie "Skłodowska", "mikolaj" znajdzie "Mikołaj")
+    const plResults = db.searchArticlesFTS('sklodowska');
+    assert.ok(plResults.length > 0, 'Powinien odnaleźć Marię Skłodowską-Curie przy zapytaniu bez znaków diakrytycznych');
+    assert.equal(plResults[0].slug, 'maria-sklodowska-curie');
+    assert.ok(plResults[0].snippet.includes('<mark class="search-highlight">'), 'Snippet powinien podświetlić znalezione słowo');
+
+    const plWithDiacritics = db.searchArticlesFTS('Mikołaj');
+    assert.ok(plWithDiacritics.length > 0, 'Powinien odnaleźć Mikołaj Kopernik przy zapytaniu ze znakami diakrytycznymi');
+    assert.equal(plWithDiacritics[0].slug, 'mikolaj-kopernik');
+
+    // 3. Wyszukiwanie pustego zapytania
+    const emptyResults = db.searchArticlesFTS('');
+    assert.deepEqual(emptyResults, [], 'Puste zapytanie powinno zwrócić pustą tablicę');
+  });
+
+  test('zarządzanie multimediami (media: addMedia, listMedia, getMediaByFilename)', () => {
+    // 1. Dodanie nowego wpisu pliku multimedialnego
+    const added = db.addMedia({
+      filename: 'mikolaj-kopernik-portret.png',
+      original_name: 'portret.png',
+      mime_type: 'image/png',
+      size_bytes: 45678,
+      uploader: 'admin'
+    });
+    assert.ok(added.id, 'Nowy rekord media powinien mieć nadane id');
+    assert.equal(added.filename, 'mikolaj-kopernik-portret.png');
+    assert.equal(added.original_name, 'portret.png');
+    assert.equal(added.mime_type, 'image/png');
+    assert.equal(added.size_bytes, 45678);
+    assert.equal(added.uploader, 'admin');
+    assert.equal(added.url, '/uploads/mikolaj-kopernik-portret.png');
+
+    // 2. Pobranie po nazwie pliku
+    const fetched = db.getMediaByFilename('mikolaj-kopernik-portret.png');
+    assert.ok(fetched, 'Powinien odnaleźć plik po nazwie');
+    assert.equal(fetched.id, added.id);
+    assert.equal(fetched.mime_type, 'image/png');
+
+    // Brakujący plik zwraca null
+    assert.strictEqual(db.getMediaByFilename('nie-ma-takiego-pliku.png'), null);
+
+    // 3. Pobranie listy mediów
+    const list = db.listMedia({ limit: 10 });
+    assert.ok(Array.isArray(list));
+    const foundInList = list.find(m => m.filename === 'mikolaj-kopernik-portret.png');
+    assert.ok(foundInList, 'Plik powinien znajdować się na liście pobranych mediów');
+
+    // 4. Walidacja błędnych danych w addMedia
+    assert.throws(() => {
+      db.addMedia({ filename: '', original_name: 'x', mime_type: 'image/png' });
+    }, /Nazwa pliku/);
+  });
+
+  test('zarządzanie listą obserwowanych (watchlist: toggleWatchlist, isWatching, getWatchlistArticles, getWatchlistRecentChanges)', () => {
+    const userId = 1; // admin
+    const testSlug = 'mikolaj-kopernik';
+
+    // 1. Sprawdzenie stanu początkowego
+    assert.equal(db.isWatching(userId, testSlug), false);
+
+    // 2. Dodanie do obserwowanych
+    const watchRes = db.toggleWatchlist(userId, testSlug);
+    assert.equal(watchRes.watching, true);
+    assert.equal(watchRes.slug, testSlug);
+    assert.equal(db.isWatching(userId, testSlug), true);
+
+    // 3. Pobranie listy obserwowanych artykułów
+    const watchedArticles = db.getWatchlistArticles(userId);
+    assert.ok(Array.isArray(watchedArticles));
+    assert.ok(watchedArticles.some(a => a.slug === testSlug), 'Artykuł powinien być w obserwowanych');
+
+    // 4. Pobranie ostatnich zmian obserwowanych artykułów
+    const watchedChanges = db.getWatchlistRecentChanges(userId);
+    assert.ok(Array.isArray(watchedChanges));
+    assert.ok(watchedChanges.some(c => c.article_slug === testSlug), 'Ostatnie zmiany artykułu powinny być w obserwowanych zmianach');
+
+    // 5. Usunięcie z obserwowanych (toggle off)
+    const unwatchRes = db.toggleWatchlist(userId, testSlug);
+    assert.equal(unwatchRes.watching, false);
+    assert.equal(db.isWatching(userId, testSlug), false);
+
+    const watchedAfter = db.getWatchlistArticles(userId);
+    assert.ok(!watchedAfter.some(a => a.slug === testSlug), 'Artykuł nie powinien już być w obserwowanych');
+
+    // 6. Odporność na brakujące argumenty
+    assert.equal(db.isWatching(null, testSlug), false);
+    assert.deepEqual(db.getWatchlistArticles(null), []);
+    assert.deepEqual(db.getWatchlistRecentChanges(null), []);
+    assert.throws(() => db.toggleWatchlist(null, testSlug), /Brak ID/);
+  });
+
+  test('bezpieczeństwo i odporność FTS5: sanityzacja symboli specjalnych (*, ", AND, nawiasy) i limit długości', () => {
+    // 1. Złożone zapytania z symbolami specjalnymi, niesparowanymi cudzysłowami i operatorami
+    assert.doesNotThrow(() => {
+      const res1 = db.searchArticlesFTS('C++ "test (unclosed');
+      assert.ok(Array.isArray(res1));
+    });
+
+    assert.doesNotThrow(() => {
+      const res2 = db.searchArticlesFTS('"Polska" + AND + (test*):');
+      assert.ok(Array.isArray(res2));
+      assert.ok(res2.some(r => r.slug === 'polska'));
+    });
+
+    assert.doesNotThrow(() => {
+      const res3 = db.searchArticlesFTS('*** """ ((( ))) AND OR NOT');
+      assert.deepEqual(res3, []);
+    });
+
+    // 2. Limit długości zapytania: zapytania o długości < 2 znaków zwracają pustą tablicę
+    assert.deepEqual(db.searchArticlesFTS('a'), []);
+    assert.deepEqual(db.searchArticlesFTS('*'), []);
+    assert.deepEqual(db.searchArticlesFTS(' '), []);
+    assert.deepEqual(db.searchArticlesFTS(null), []);
+  });
+
+  test('kaskadowe czyszczenie listy obserwowanych przy usuwaniu artykułu (deleteArticle)', () => {
+    // 1. Utworzenie tymczasowego artykułu
+    const temp = db.createArticle({
+      title: 'Tymczasowy Artykuł Do Usunięcia',
+      slug: 'tymczasowy-artykul-do-usuniecia',
+      content: 'Treść tymczasowa do sprawdzenia referential integrity.',
+      editor: 'admin'
+    });
+
+    // 2. Dodanie do obserwowanych
+    const watchRes = db.toggleWatchlist(1, temp.slug);
+    assert.equal(watchRes.watching, true);
+    assert.equal(db.isWatching(1, temp.slug), true);
+
+    const watchedBefore = db.getWatchlistArticles(1);
+    assert.ok(watchedBefore.some(a => a.slug === temp.slug));
+
+    // 3. Usunięcie artykułu przez deleteArticle
+    const deleted = db.deleteArticle(temp.slug, 'admin');
+    assert.equal(deleted, true);
+
+    // 4. Weryfikacja usunięcia z watchlist
+    assert.equal(db.isWatching(1, temp.slug), false);
+    const watchedAfter = db.getWatchlistArticles(1);
+    assert.ok(!watchedAfter.some(a => a.slug === temp.slug), 'Usunięty artykuł musi zniknąć z listy obserwowanych');
+  });
 });
 
 // =============================================================================
@@ -460,7 +643,7 @@ describe('3. Serwer HTTP API (src/server.js)', () => {
       });
       req.on('error', reject);
       if (options.body) {
-        req.write(typeof options.body === 'string' ? options.body : JSON.stringify(options.body));
+        req.write(typeof options.body === 'string' || Buffer.isBuffer(options.body) ? options.body : JSON.stringify(options.body));
       }
       req.end();
     });
@@ -1003,6 +1186,267 @@ describe('3. Serwer HTTP API (src/server.js)', () => {
     // 2. Próba wyjścia poza public/ (path traversal) -> 403 Forbidden
     const traversal = await apiRequest('/../package.json');
     assert.equal(traversal.status, 403, 'Path traversal poza katalog public/ musi zwracać 403 Forbidden');
+  });
+
+  test('GET /api/search - zaawansowane wyszukiwanie z parametrem q i snippetami', async () => {
+    // 1. Wyszukiwanie zapytania "kopernik"
+    const searchRes = await apiRequest('/api/search?q=kopernik');
+    assert.equal(searchRes.status, 200);
+    assert.ok(Array.isArray(searchRes.json.results));
+    assert.ok(Array.isArray(searchRes.json.articles));
+    assert.ok(searchRes.json.results.length > 0);
+    const found = searchRes.json.results.find(r => r.slug === 'mikolaj-kopernik');
+    assert.ok(found, 'W wynikach powinien znaleźć się Mikołaj Kopernik');
+    assert.ok(found.snippet.includes('<mark class="search-highlight">'), 'Snippet musi zawierać <mark>');
+
+    // 2. Puste zapytanie zwraca pustą tablicę
+    const emptyRes = await apiRequest('/api/search');
+    assert.equal(emptyRes.status, 200);
+    assert.deepEqual(emptyRes.json.results, []);
+  });
+
+  test('POST /api/upload i GET /api/media - autoryzacja, walidacja formatów i wgrywanie plików', async () => {
+    // 1. Niezalogowany użytkownik -> 401
+    const unauthUpload = await apiRequest('/api/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: { filename: 'test.png', data: 'abc' }
+    });
+    assert.equal(unauthUpload.status, 401);
+
+    // 2. Zablokowany użytkownik -> 403
+    const blockedUpload = await apiRequest('/api/upload', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${blockedToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: { filename: 'test.png', data: 'abc' }
+    });
+    assert.equal(blockedUpload.status, 403);
+
+    // 3. Nieprawidłowy typ MIME -> 400
+    const badMimeUpload = await apiRequest('/api/upload', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: {
+        filename: 'malware.exe',
+        mime_type: 'application/x-msdownload',
+        data: Buffer.from('fake exe').toString('base64')
+      }
+    });
+    assert.equal(badMimeUpload.status, 400);
+
+    // 4. Poprawne przesłanie pliku graficznego SVG (base64)
+    const svgData = '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><circle cx="5" cy="5" r="5" fill="green"/></svg>';
+    const base64Data = Buffer.from(svgData).toString('base64');
+    const validUpload = await apiRequest('/api/upload', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: {
+        filename: 'kurekk-logo.svg',
+        original_name: 'kurekk-logo.svg',
+        mime_type: 'image/svg+xml',
+        data: `data:image/svg+xml;base64,${base64Data}`
+      }
+    });
+    assert.equal(validUpload.status, 201);
+    assert.ok(validUpload.json.media);
+    assert.ok(validUpload.json.media.filename.includes('kurekk-logo'));
+    assert.equal(validUpload.json.media.mime_type, 'image/svg+xml');
+    assert.ok(validUpload.json.url.startsWith('/uploads/'));
+
+    const uploadedFilename = validUpload.json.media.filename;
+
+    // 5. Pobranie listy mediów GET /api/media
+    const mediaListRes = await apiRequest('/api/media');
+    assert.equal(mediaListRes.status, 200);
+    assert.ok(Array.isArray(mediaListRes.json.media));
+    assert.ok(mediaListRes.json.media.some(m => m.filename === uploadedFilename));
+
+    // Sprzątanie po teście
+    const uploadedFilePath = path.join(ROOT_DIR, 'public', 'uploads', uploadedFilename);
+    if (fs.existsSync(uploadedFilePath)) {
+      fs.unlinkSync(uploadedFilePath);
+    }
+    const uploadsDir = path.join(ROOT_DIR, 'public', 'uploads');
+    if (fs.existsSync(uploadsDir) && fs.readdirSync(uploadsDir).length === 0) {
+      fs.rmdirSync(uploadsDir);
+    }
+  });
+
+  test('Watchlist API: POST /api/watchlist/:slug/toggle, GET /api/watchlist, GET /api/watchlist/changes oraz isWatching w widoku artykułu', async () => {
+    // 1. Niezalogowany użytkownik nie może operować na liście obserwowanych (401)
+    const unauthToggle = await apiRequest('/api/watchlist/mikolaj-kopernik/toggle', { method: 'POST' });
+    assert.equal(unauthToggle.status, 401);
+
+    const unauthWatchlist = await apiRequest('/api/watchlist');
+    assert.equal(unauthWatchlist.status, 401);
+
+    const unauthChanges = await apiRequest('/api/watchlist/changes');
+    assert.equal(unauthChanges.status, 401);
+
+    // 2. Nieistniejący artykuł przy toggle -> 404
+    const notFoundToggle = await apiRequest('/api/watchlist/nie-ma-takiego-artykulu/toggle', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    assert.equal(notFoundToggle.status, 404);
+
+    // 3. Sprawdzenie widoku artykułu przed dodaniem do obserwowanych
+    const artBefore = await apiRequest('/api/articles/mikolaj-kopernik', {
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    assert.equal(artBefore.status, 200);
+    assert.equal(artBefore.json.isWatching, false);
+
+    // Dla gościa isWatching zawsze jest false
+    const artGuest = await apiRequest('/api/articles/mikolaj-kopernik');
+    assert.equal(artGuest.status, 200);
+    assert.equal(artGuest.json.isWatching, false);
+
+    // 4. Dodanie do obserwowanych
+    const watchRes = await apiRequest('/api/watchlist/mikolaj-kopernik/toggle', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    assert.equal(watchRes.status, 200);
+    assert.equal(watchRes.json.watching, true);
+
+    // Widok artykułu z tokenem zwraca teraz isWatching = true
+    const artAfter = await apiRequest('/api/articles/mikolaj-kopernik', {
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    assert.equal(artAfter.status, 200);
+    assert.equal(artAfter.json.isWatching, true);
+
+    // 5. Pobranie listy obserwowanych
+    const listRes = await apiRequest('/api/watchlist', {
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    assert.equal(listRes.status, 200);
+    assert.ok(Array.isArray(listRes.json.articles));
+    assert.ok(listRes.json.articles.some(a => a.slug === 'mikolaj-kopernik'));
+
+    // 6. Pobranie zmian obserwowanych
+    const changesRes = await apiRequest('/api/watchlist/changes', {
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    assert.equal(changesRes.status, 200);
+    assert.ok(Array.isArray(changesRes.json.changes));
+
+    // 7. Usunięcie z obserwowanych
+    const unwatchRes = await apiRequest('/api/watchlist/mikolaj-kopernik/toggle', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    assert.equal(unwatchRes.status, 200);
+    assert.equal(unwatchRes.json.watching, false);
+
+    // Widok artykułu znowu zwraca isWatching = false
+    const artFinal = await apiRequest('/api/articles/mikolaj-kopernik', {
+      headers: { 'Authorization': `Bearer ${adminToken}` }
+    });
+    assert.equal(artFinal.status, 200);
+    assert.equal(artFinal.json.isWatching, false);
+  });
+
+  test('Hardening: weryfikacja magic bytes dla PNG/JPEG/WEBP, sanityzacja XSS w SVG oraz nagłówek CSP', async () => {
+    // 1. Fałszywy PNG: tekst oznaczony jako image/png zwraca 400
+    const fakePngRes = await apiRequest('/api/upload', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: {
+        filename: 'fake.png',
+        mime_type: 'image/png',
+        data: Buffer.from('NOT A REAL PNG FILE').toString('base64')
+      }
+    });
+    assert.equal(fakePngRes.status, 400);
+    assert.ok(fakePngRes.json.error.includes('magic bytes') || fakePngRes.json.error.includes('PNG'));
+
+    // 2. Prawidłowy PNG ze sygnaturą magic bytes: 89 50 4E 47 0D 0A 1A 0A
+    const validPngHeader = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D]);
+    const validPngRes = await apiRequest('/api/upload', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: {
+        filename: 'valid.png',
+        mime_type: 'image/png',
+        data: validPngHeader.toString('base64')
+      }
+    });
+    assert.equal(validPngRes.status, 201);
+    const validPngFile = validPngRes.json.media.filename;
+
+    // 3. Fałszywy JPEG bez sygnatury FF D8 FF zwraca 400
+    const fakeJpgRes = await apiRequest('/api/upload', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: {
+        filename: 'fake.jpg',
+        mime_type: 'image/jpeg',
+        data: Buffer.from('NOT A JPEG').toString('base64')
+      }
+    });
+    assert.equal(fakeJpgRes.status, 400);
+
+    // 4. Sanityzacja SVG: usunięcie <script>, <iframe>, <object> oraz atrybutów zdarzeń (onload, onclick)
+    const maliciousSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+      <script>alert("xss")</script>
+      <iframe src="https://evil.com"></iframe>
+      <rect width="50" height="50" fill="blue" onload="alert(1)" onclick="alert(2)" />
+    </svg>`;
+    const svgUpload = await apiRequest('/api/upload', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: {
+        filename: 'sanitized.svg',
+        mime_type: 'image/svg+xml',
+        data: Buffer.from(maliciousSvg).toString('base64')
+      }
+    });
+    assert.equal(svgUpload.status, 201);
+    const svgFilename = svgUpload.json.media.filename;
+
+    // 5. Pobranie zapisanego pliku SVG i weryfikacja braku skryptów oraz nagłówka CSP
+    const svgServeRes = await apiRequest(`/uploads/${svgFilename}`);
+    assert.equal(svgServeRes.status, 200);
+    assert.ok(!svgServeRes.body.includes('<script>'), 'SVG nie może zawierać znacznika <script>');
+    assert.ok(!svgServeRes.body.includes('alert('), 'SVG nie może zawierać wywołań JavaScript');
+    assert.ok(!svgServeRes.body.includes('<iframe>'), 'SVG nie może zawierać <iframe>');
+    assert.ok(!svgServeRes.body.includes('onload='), 'SVG nie może zawierać atrybutu onload');
+    assert.ok(!svgServeRes.body.includes('onclick='), 'SVG nie może zawierać atrybutu onclick');
+    assert.ok(svgServeRes.headers['content-security-policy'], 'SVG musi być serwowane z nagłówkiem CSP');
+    assert.ok(svgServeRes.headers['content-security-policy'].includes("default-src 'none'"));
+
+    // Sprzątanie plików testowych
+    for (const fn of [validPngFile, svgFilename]) {
+      const p = path.join(ROOT_DIR, 'public', 'uploads', fn);
+      if (fs.existsSync(p)) fs.unlinkSync(p);
+    }
+    const uploadsDir = path.join(ROOT_DIR, 'public', 'uploads');
+    if (fs.existsSync(uploadsDir) && fs.readdirSync(uploadsDir).length === 0) {
+      fs.rmdirSync(uploadsDir);
+    }
   });
 });
 
